@@ -1341,7 +1341,10 @@ fn selected_items_summary(entries: &[FileEntry]) -> String {
     names
 }
 
-fn context_entries(state: &ViewState, target: &RefCell<Option<ContextTarget>>) -> Vec<FileEntry> {
+pub(super) fn context_entries(
+    state: &ViewState,
+    target: &RefCell<Option<ContextTarget>>,
+) -> Vec<FileEntry> {
     if let Some((None, entry)) = target.borrow().as_ref() {
         return vec![entry.clone()];
     }
@@ -1467,6 +1470,28 @@ pub(super) fn context_menu_option(icon: &str, label: &str, accelerator: &str) ->
     button
 }
 
+pub(super) fn context_menu_danger_option(icon: &str, label: &str, accelerator: &str) -> gtk::Button {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let icon = crate::assets::danger_icon(icon, 15);
+    icon.add_css_class("folder-context-icon");
+    let title = gtk::Label::new(Some(label));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    row.append(&icon);
+    row.append(&title);
+    if !accelerator.is_empty() {
+        let shortcut = gtk::Label::new(Some(accelerator));
+        shortcut.add_css_class("folder-context-shortcut");
+        row.append(&shortcut);
+    }
+    let button = crate::ui::accessibility::menu_item_button();
+    crate::ui::accessibility::describe_menu_item(&button, label, accelerator);
+    button.add_css_class("folder-context-option");
+    button.add_css_class("danger");
+    button.set_child(Some(&row));
+    button
+}
+
 fn context_menu_toggle_option(
     icon: &str,
     label: &str,
@@ -1483,13 +1508,13 @@ fn context_menu_toggle_option(
 /// In Trash this shared action deletes permanently, so `can_trash` is irrelevant.
 /// Unknown capabilities retain the delete fallback (#179); callers exclude
 /// nested Trash children, which GVfs cannot remove independently.
-fn move_to_trash_is_visible(in_trash: bool, can_trash: Option<bool>) -> bool {
+pub(super) fn move_to_trash_is_visible(in_trash: bool, can_trash: Option<bool>) -> bool {
     in_trash || can_trash.unwrap_or(true)
 }
 
 /// Hidden in Trash, where the shared delete action is already permanent, or
 /// when GIO confirms deletion is unsupported.
-fn permanently_delete_is_visible(in_trash: bool, can_delete: Option<bool>) -> bool {
+pub(super) fn permanently_delete_is_visible(in_trash: bool, can_delete: Option<bool>) -> bool {
     !in_trash && can_delete.unwrap_or(true)
 }
 
