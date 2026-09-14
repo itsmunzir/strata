@@ -13,7 +13,7 @@ struct Request {
 }
 
 #[derive(Default)]
-struct HeldSource(RefCell<Option<Request>>);
+pub(super) struct HeldSource(RefCell<Option<Request>>);
 
 impl FileSource for HeldSource {
     fn validate_location(&self, _: &Location) -> Result<(), LocationValidationError> {
@@ -30,7 +30,7 @@ impl FileSource for HeldSource {
 }
 
 impl HeldSource {
-    fn finish(&self) {
+    pub(super) fn finish(&self) {
         let request = self.0.borrow();
         let request = request.as_ref().expect("directory request");
         (request.emit)(DirectoryEvent::Finished {
@@ -54,7 +54,7 @@ impl HeldSource {
         self.batch_at(Location::local(root.join("example.txt")));
     }
 
-    fn batch_at(&self, location: Location) {
+    pub(super) fn batch_at(&self, location: Location) {
         let name = location.display_name();
         let request = self.0.borrow();
         let request = request.as_ref().expect("directory request");
@@ -97,7 +97,7 @@ fn assert_page(stacks: &[gtk::Stack], page: &str) {
     }
 }
 
-fn settle() {
+pub(super) fn settle() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     while std::time::Instant::now() < deadline {
         while glib::MainContext::default().iteration(false) {}

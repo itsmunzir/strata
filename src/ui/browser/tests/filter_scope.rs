@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+use super::loading::{HeldSource, settle};
 use super::*;
 use crate::ui::theme::ThemeManager;
 use std::time::{Duration, Instant};
@@ -163,6 +164,74 @@ fn saved_filter_scope_updates_two_windows_and_rebuilt_views_without_settings() {
             for window in windows {
                 window.close();
             }
+        },
+    );
+}
+
+fn trashed_labels(widget: &gtk::Widget) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(label) = widget.downcast_ref::<gtk::Label>()
+        && label.is_mapped()
+        && ["needle.txt", "other.txt"].contains(&label.text().as_str())
+    {
+        names.push(label.text().to_string());
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        names.extend(trashed_labels(&widget));
+        child = widget.next_sibling();
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn filter_result_rows(widget: &gtk::Widget) -> usize {
+    let mut count = usize::from(widget.has_css_class("filter-result") && widget.is_mapped());
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        count += filter_result_rows(&widget);
+        child = widget.next_sibling();
+    }
+    count
+}
+
+#[test]
+fn pane_filter_matches_names_in_trash_without_recursive_search() {
+    crate::test_support::gtk_test(
+        "ui::browser::tests::filter_scope::pane_filter_matches_names_in_trash_without_recursive_search",
+        || {
+            ThemeManager::seed_saved_preferences_for_test();
+            let manager = ThemeManager::shared();
+            manager.set_browser_mode(BrowserMode::Columns);
+            let source = Rc::new(HeldSource::default());
+            let view = BrowserView::new(source.clone(), PeekBehavior::default());
+            let window = gtk::Window::builder()
+                .child(&view.widget())
+                .default_width(900)
+                .default_height(500)
+                .build();
+            window.present();
+            view.browser().navigate(Location::uri("trash:///"));
+            settle();
+            source.batch_at(Location::uri("trash:///needle.txt"));
+            source.batch_at(Location::uri("trash:///other.txt"));
+            source.finish();
+            wait_until(|| {
+                view.browser()
+                    .column_snapshot(0)
+                    .is_some_and(|snapshot| !snapshot.loading && snapshot.count == 2)
+            });
+            assert!(view.show_filter_with_query("needle"));
+            wait_until(|| trashed_labels(&view.widget()) == ["needle.txt"]);
+            assert_eq!(
+                filter_result_rows(&view.widget()),
+                0,
+                "trash filtering must stay local, not recursive"
+            );
+            assert!(view.show_filter_with_query(""));
+            wait_until(|| trashed_labels(&view.widget()) == ["needle.txt", "other.txt"]);
+            window.close();
         },
     );
 }

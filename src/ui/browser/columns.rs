@@ -795,9 +795,30 @@ impl ViewState {
                 return;
             }
             *filter_query.borrow_mut() = fold_for_search(&text);
+            let Some(state) = weak_state_for_search.upgrade() else {
+                return;
+            };
+            let Some(path) = state
+                .browser
+                .location_at(depth_for_search)
+                .and_then(|loc| loc.native_path().map(Path::to_path_buf))
+            else {
+                // Non-native locations such as Trash or network shares have no
+                // filesystem path to index, so filter the listed entries by name
+                // instead of starting the recursive search. The recursive flag
+                // must stay clear: leaving it set breaks selection sync and
+                // keyboard navigation for the column.
+                search_active_for_changed.set(false);
+                apply_filter_query(
+                    &filtered_model_for_search,
+                    &filter,
+                    &filter_query,
+                    fold_for_search(&text),
+                );
+                return;
+            };
             search_active_for_changed.set(true);
             let weak_entry = weak_filter_entry.clone();
-            let weak_state = weak_state_for_search.clone();
             let filtered = filtered_model_for_search.clone();
             let sm = search_model_for_changed.clone();
             let results = search_results_for_changed.clone();
@@ -806,16 +827,6 @@ impl ViewState {
             let selection_for_poll = selection_for_search.clone();
             let syncing_for_poll = syncing_for_search.clone();
             if handle.borrow().is_none() {
-                let Some(state) = weak_state.upgrade() else {
-                    return;
-                };
-                let Some(path) = state
-                    .browser
-                    .location_at(depth_for_search)
-                    .and_then(|loc| loc.native_path().map(Path::to_path_buf))
-                else {
-                    return;
-                };
                 search_gen.set(search_gen.get().saturating_add(1));
                 let poll_gen = search_gen.get();
                 let show_hidden = state
