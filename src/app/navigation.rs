@@ -590,9 +590,19 @@ impl NavigationState {
                 remove_monitored_entry(&mut column.entries, &location, &mut splices);
                 if selected_was_removed && replace_selection {
                     selected_location = removed_position.and_then(|position| {
-                        column
-                            .entries
-                            .get(position.min(column.entries.len().saturating_sub(1)))
+                        // Focus and preview move to the nearest VISIBLE neighbor. Picking the row at
+                        // the same index alone lands on a hidden file whenever the next row in sort
+                        // order is one, and the pane is not listing it (#1410).
+                        let visible = |index: usize| {
+                            column
+                                .entries
+                                .get(index)
+                                .is_some_and(|entry| preferences.show_hidden || !entry.is_hidden)
+                        };
+                        let next = (position..column.entries.len()).find(|&index| visible(index));
+                        let previous = (0..position).rev().find(|&index| visible(index));
+                        next.or(previous)
+                            .and_then(|index| column.entries.get(index))
                             .map(|entry| entry.location.clone())
                     });
                     if !self.preserve_fill_on_removal

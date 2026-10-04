@@ -385,6 +385,69 @@ fn select_all_excludes_hidden_entries_unless_shown() {
 }
 
 #[test]
+fn deleting_an_entry_skips_a_hidden_neighbor() {
+    // Hidden files off, preview open: after a delete, focus and preview follow the nearest VISIBLE
+    // neighbor. The replacement used to be the row at the same index, which is the hidden file the
+    // pane is not listing (#1410).
+    let cases: Vec<(Vec<&'static str>, &'static str, Option<&'static str>)> = vec![
+        // The only candidate is hidden: nothing visible to move to, so nothing is selected.
+        (vec!["alpha.txt", ".hidden.txt"], "alpha.txt", None),
+        // The next row is hidden; the one after it is visible.
+        (
+            vec![".hidden.txt", "alpha.txt", "charlie.txt"],
+            "alpha.txt",
+            Some("charlie.txt"),
+        ),
+        // No next row; the previous VISIBLE one is the neighbor.
+        (
+            vec![".hidden.txt", "alpha.txt", "bravo.txt", "charlie.txt"],
+            "charlie.txt",
+            Some("bravo.txt"),
+        ),
+    ];
+
+    for (names, removed, expected) in cases {
+        let source = ScriptedSource::scripted(names, Vec::new());
+        let browser = Browser::new(Rc::new(source));
+        let parent = Location::local("/fixture");
+        browser.navigate(parent.clone());
+
+        let order = column_names(&browser, 0);
+        let focused = order
+            .iter()
+            .position(|name| name == removed)
+            .unwrap_or_else(|| panic!("{removed} should be listed in {order:?}"));
+        browser.select(0, focused);
+
+        browser.handle_directory_change(
+            0,
+            &parent,
+            DirectoryChange::Remove(Location::local(format!("/fixture/{removed}"))),
+        );
+
+        let focused_name = browser
+            .focused_item()
+            .and_then(|(_, position, _)| browser.entry_at(0, position))
+            .map(|entry| entry.display_name);
+        assert_eq!(
+            focused_name.as_deref(),
+            expected,
+            "removing {removed} from {order:?}"
+        );
+        let selected_name = browser
+            .selected_positions(0)
+            .first()
+            .and_then(|&position| browser.entry_at(0, position))
+            .map(|entry| entry.display_name);
+        assert_eq!(
+            selected_name.as_deref(),
+            expected,
+            "removing {removed} from {order:?}"
+        );
+    }
+}
+
+#[test]
 fn repeated_identical_batches_emit_selection_only_once() {
     let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
