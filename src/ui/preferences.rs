@@ -40,11 +40,22 @@ pub(crate) enum InterfaceRenderer {
     System,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OmarchyVariant {
+    #[default]
+    Original,
+    Darker,
+    HighContrast,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(in crate::ui) struct Preferences {
     mode: String,
     theme: String,
-    #[serde(default = "default_enabled")]
+    #[serde(default)]
+    omarchy_variant: OmarchyVariant,
+    #[serde(default)]
     folder_peeking: bool,
     #[serde(default = "default_enabled")]
     single_click_previews: bool,
@@ -58,6 +69,8 @@ pub(in crate::ui) struct Preferences {
     video_preview_backend: String,
     #[serde(default)]
     search_open_files_directly: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    search_exclusions: Vec<String>,
     #[serde(default = "default_enabled")]
     type_to_search: bool,
     #[serde(default)]
@@ -196,13 +209,15 @@ impl Default for Preferences {
         Self {
             mode: "theme".to_owned(),
             theme: "tokyo-night".to_owned(),
-            folder_peeking: true,
+            omarchy_variant: OmarchyVariant::default(),
+            folder_peeking: false,
             single_click_previews: true,
             columns_mirror_selection: true,
             render_documents_by_default: true,
             hardware_accelerated_video_previews: None,
             video_preview_backend: default_video_preview_backend(),
             search_open_files_directly: false,
+            search_exclusions: Vec::new(),
             type_to_search: true,
             arrow_navigation_scoped: false,
             tenxer_mode: false,
@@ -651,6 +666,15 @@ impl PreferenceManager {
         self.save_preferences();
     }
 
+    pub fn search_exclusions(&self) -> Vec<String> {
+        self.preferences.borrow().search_exclusions.clone()
+    }
+
+    pub fn set_search_exclusions(&self, exclusions: Vec<String>) {
+        self.preferences.borrow_mut().search_exclusions = exclusions;
+        self.save_preferences();
+    }
+
     pub fn filter_include_subfolders(&self) -> bool {
         self.preferences.borrow().filter_include_subfolders
     }
@@ -710,6 +734,18 @@ impl PreferenceManager {
         refresh: impl Fn(&gtk::Widget, bool) + 'static,
     ) {
         self.bind_preference(anchor, Self::show_keybinding_hints, refresh);
+    }
+
+    pub fn omarchy_variant(&self) -> OmarchyVariant {
+        self.preferences.borrow().omarchy_variant
+    }
+
+    pub fn set_omarchy_variant(&self, variant: OmarchyVariant) {
+        if self.omarchy_variant() == variant {
+            return;
+        }
+        self.preferences.borrow_mut().omarchy_variant = variant;
+        self.save_preferences();
     }
 
     pub fn element_glow(&self) -> bool {

@@ -142,15 +142,31 @@ pub(super) fn window_overlay(parent: &impl IsA<gtk::Widget>) -> Option<gtk::Over
         .and_downcast::<gtk::Overlay>()
 }
 
-#[expect(
-    deprecated,
-    reason = "GTK 4.12 deprecated translate_coordinates and allocation without a replacement for click-in-bounds checks"
-)]
 pub(super) fn modal_layer(
     content: &impl IsA<gtk::Widget>,
     overlay: &gtk::Overlay,
     root: Option<BlurBin>,
     block_dismiss: Option<Rc<dyn Fn() -> bool>>,
+) -> gtk::Box {
+    let overlay = overlay.clone();
+    modal_layer_with_backdrop(
+        content,
+        Rc::new(move |layer: &gtk::Box| {
+            if block_dismiss.as_ref().is_some_and(|block| block()) {
+                return;
+            }
+            dismiss_modal_layer(layer, &overlay, root.as_ref());
+        }),
+    )
+}
+
+#[expect(
+    deprecated,
+    reason = "GTK 4.12 deprecated translate_coordinates and allocation without a replacement for click-in-bounds checks"
+)]
+pub(super) fn modal_layer_with_backdrop(
+    content: &impl IsA<gtk::Widget>,
+    on_backdrop: Rc<dyn Fn(&gtk::Box)>,
 ) -> gtk::Box {
     let layer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     layer.add_css_class("app-modal-layer");
@@ -166,15 +182,7 @@ pub(super) fn modal_layer(
     let weak_layer = layer.downgrade();
     let weak_viewport = viewport.downgrade();
     let weak_content = content.as_ref().downgrade();
-    let overlay = overlay.clone();
-    let root = root.clone();
-    let block = block_dismiss.clone();
     click.connect_pressed(move |_, _, x, y| {
-        if let Some(block) = block.as_ref()
-            && block()
-        {
-            return;
-        }
         let Some(layer) = weak_layer.upgrade() else {
             return;
         };
@@ -196,7 +204,7 @@ pub(super) fn modal_layer(
                 })
         });
         if !on_dialog {
-            dismiss_modal_layer(&layer, &overlay, root.as_ref());
+            on_backdrop(&layer);
         }
     });
     layer.add_controller(click);
@@ -317,10 +325,24 @@ pub(super) fn show_error_dialog(parent: &impl IsA<gtk::Widget>, message: &str, d
     show_error_dialog_after_close(parent, message, detail, Rc::new(|| {}));
 }
 
+pub(super) fn show_information_dialog(parent: &impl IsA<gtk::Widget>, message: &str, detail: &str) {
+    show_message_dialog(parent, message, detail, false, Rc::new(|| {}));
+}
+
 pub(super) fn show_error_dialog_after_close(
     parent: &impl IsA<gtk::Widget>,
     message: &str,
     detail: &str,
+    on_close: Rc<dyn Fn()>,
+) {
+    show_message_dialog(parent, message, detail, true, on_close);
+}
+
+fn show_message_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    message: &str,
+    detail: &str,
+    error: bool,
     on_close: Rc<dyn Fn()>,
 ) {
     let Some(ModalHost {
@@ -346,15 +368,25 @@ pub(super) fn show_error_dialog_after_close(
     };
 
     let layout = message_dialog_layout(
-        crate::assets::icons::X,
+        if error {
+            crate::assets::icons::X
+        } else {
+            crate::assets::icons::INFO
+        },
         message,
-        if message == "Completed with errors" {
+        if !error {
+            "Reported by the file provider"
+        } else if message == "Completed with errors" {
             "Some items could not be processed"
         } else {
             "The operation could not be completed"
         },
         "Close",
-        ModalTone::Danger,
+        if error {
+            ModalTone::Danger
+        } else {
+            ModalTone::Accent
+        },
     );
     layout.cancel.set_visible(false);
     let explanation = message_dialog_description(detail);

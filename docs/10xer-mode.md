@@ -69,7 +69,7 @@ sidebar. In Icons, **h** / **j** / **k** / **l** and arrows move among tiles.
 | **Backspace** / **Alt+↑** | Parent folder |
 | **i** | On a file: toggle the preview drawer without moving focus into it. On a directory: in Columns, open the next Miller column without moving focus into it (mirroring usually has already); in List and Icons, toggle the folder-peek popover. |
 | **J** / **K** | Scroll the open preview without taking focus |
-| **<** / **>** | While the open preview shows audio: move to the previous / next audio file and keep playing, without taking focus |
+| **<** / **>** | While the open preview shows audio or video: move to the previous / next file of the same type and keep playing, without taking focus |
 
 In Columns, the saved **Mirror columns selection** preference (on by default)
 applies to the cursor: shortly after **j** / **k** / arrows land on a directory,
@@ -135,13 +135,13 @@ every other key is typed or edits the text.
 | **j** / **k** / **↑** / **↓** | Scroll | Move the member highlight | Typed / text editing | **↑** / **↓** volume; **j** / **k** swallowed |
 | **h** / **←** | Return to the listing | Archive parent; at the archive root, return to the listing | Typed / caret | **h** returns to the listing; **←** seeks −5 s |
 | **l** / **→** | Swallowed | Open the highlighted folder; a member file does nothing | Typed / caret | **→** seeks +5 s; **l** swallowed |
-| **Enter** | Open the file from the listing | Same as **l** | Unlock | Open the file from the listing |
+| **Enter** | Open the file from the listing | Same as **l** | Unlock | Open the file from the listing; a video opens in the default player where the preview stopped |
 | **Space** | Swallowed | Swallowed | Typed | Play / pause |
 | **i** | Close the drawer | Close the drawer | Typed | Close the drawer |
 | **Home** / **G** / **End** | Top / bottom | First / last member | Caret (**G** typed) | Swallowed |
 | Paging keys | Scroll half / full page | Swallowed | Text editing | Swallowed |
 | **m** | Swallowed | Swallowed | Typed | Mute / unmute |
-| **<** / **>** | Swallowed | Swallowed | Typed | Previous / next audio file in the listing; playback continues |
+| **<** / **>** | Swallowed | Swallowed | Typed | Previous / next file of the same type in the listing; playback continues |
 | **J** / **K** | Scroll | Scroll | Typed | Swallowed |
 | **Shift+Tab** | Return to the listing | Return to the listing | Return to the listing | Return to the listing |
 | **Esc** | Close the drawer | Close the drawer | Close the drawer | Close the drawer |
@@ -245,6 +245,23 @@ dismiss, **Esc** does nothing: it never closes a Miller column or the window.
 The sidebar and header controls take the same steps; clearing a filter or
 closing the preview from there returns focus to the file list.
 
+## Tabs
+
+From the listing, press **t**, then a second key. The footer shows **t-** and
+its available commands. Escape cancels the chord; text fields, menus, and
+file-chooser requests do not arm it.
+
+| Chord | Action |
+| --- | --- |
+| **t n** | Open a new tab at the current location |
+| **t x** | Close the active tab (the last tab closes the window) |
+| **t t** | Select the previous tab in strip order, wrapping from first to last |
+| **t 1–9** | Select tabs 1–9 in their current order |
+| **t 0** | Select tab 10 |
+
+The shared Ctrl-based tab shortcuts also remain available. Hold **Ctrl+Shift**
+to show square number badges; **0** identifies the tenth tab.
+
 ## Files
 
 With an empty fill, **y** / **x** / **d** act on the focused item. Typical flow:
@@ -288,7 +305,7 @@ like one started from the context menu. See [custom actions](custom-actions.md).
 **; t** opens a terminal in the keyboard-focused folder, the pane holding the
 cursor, whatever the cursor or selection is on. The panel lists it, then
 **; c**, **; e**, and **; E**, after the actions. In Trash and other non-local places it flashes
-`Can’t open a terminal here`. **Ctrl+T** keeps its own rule and prefers a
+`Can’t open a terminal here`. **Ctrl+Alt+T** in regular mode keeps its own rule and prefers a
 single selected folder.
 
 **; c** opens the Compress dialog for the fill, or the cursor item when nothing
@@ -405,7 +422,7 @@ visible PINNED rows (**1**–**9** in display order). **,**, **c**, and **;** sh
 the same kind of list (sort options / copy path or name / matching custom
 actions) while armed. The second key completes only that chord: **, a** /
 **, m** / **, s** / **, e** sort instead of create / search, and search-result
-**j** / **h** cannot steal a pending **g**, **c**, or **;**. Sort-chord **, n** /
+**j** / **h** cannot steal a pending **g**, **c**, **;**, or **t**. Sort-chord **, n** /
 **, t** cancel with `Unknown chord`.
 
 | Second key | Destination |
@@ -696,12 +713,17 @@ shows no hint. Default-map hints that are unbound or remapped (**Y** for copy pa
 
 ## Not bound
 
+Tabs use the same shortcuts in both modes: **Ctrl+T** creates a tab,
+**Ctrl+W** closes it, **Ctrl+Tab / Ctrl+Shift+Tab** cycles tabs, and
+**Ctrl+Shift+1–9 / 0** selects a tab directly. Hold **Ctrl+Shift** to show tab
+numbers. See [browser tabs](keyboard-navigation.md#browser-tabs).
+
 These default-map shortcuts are unbound or remapped while the mode is on:
 
 | Default-map key | In 10xer mode |
 | --- | --- |
 | **Ctrl+Shift+K** | Unbound. Use **z** / **Z**. |
-| **Ctrl+T** | Unbound. Use **;** **t** or the context menu. |
+| **Ctrl+Alt+T** | Unbound. Use **;** **t** or the context menu. |
 | **Ctrl+\\** | Unbound. Arrows never leave the file list. |
 | **Ctrl+D** | Half page down. Duplicate is dropped. |
 | **Ctrl+F** | Full page down. Filter is **f**. |

@@ -55,6 +55,7 @@ pub(crate) enum ContextHint {
     MoveTo,
     CopyTo,
     Restore,
+    RemoveFromRecent,
     Terminal,
     Trash,
     PermanentDelete,
@@ -297,7 +298,7 @@ fn tenxer_preview(mode: BrowserMode, chooser: bool) -> Vec<(&'static str, &'stat
     shortcuts.push(("J / K", "Scroll the open preview without taking focus"));
     shortcuts.push((
         "< / >",
-        "Previous / next audio file while the preview shows audio",
+        "Previous / next file of the same type while the preview shows audio or video",
     ));
     // Icons have no key that moves into the preview.
     if mode != BrowserMode::Icons {
@@ -331,7 +332,7 @@ const TENXER_PREVIEW_OWNED: &[(&str, &str)] = &[
     ),
     (
         "Space / ← → / ↑ ↓ / m / < > in media",
-        "Play, seek, volume, mute, previous / next audio file",
+        "Play, seek, volume, mute, previous / next file of the same type",
     ),
     (
         "h / ← in a document, h in media",
@@ -501,7 +502,14 @@ const DEFAULT_TOOLS: &[(&str, &str)] = &[
     ("Ctrl+Shift+K", "Jump to a recent folder"),
     ("Alt+Enter", "Open containing folder (global search)"),
     ("Ctrl+L", "Edit the location"),
-    ("Ctrl+T", "Open a terminal"),
+    ("Ctrl+T", "New tab"),
+    ("Ctrl+W", "Close the active tab"),
+    ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
+    (
+        "Ctrl+Shift+1–9 / 0",
+        "Select a tab (hold Ctrl+Shift for numbers)",
+    ),
+    ("Ctrl+Alt+T", "Open a terminal"),
     ("F5", "Refresh"),
     ("Ctrl+H / Ctrl+.", "Show or hide hidden files"),
     ("Ctrl+1 / 2 / 3", "Switch to Columns, Icons, or List"),
@@ -560,6 +568,16 @@ fn tenxer_tools(mode: BrowserMode, chooser: bool) -> Vec<(&'static str, &'static
     ];
     if !chooser {
         shortcuts.extend_from_slice(&[
+            ("t n / t x", "New / close tab"),
+            ("t t", "Previous tab"),
+            ("t 1–9 / t 0", "Select tab 1–9 / 10"),
+            ("Ctrl+T", "New tab"),
+            ("Ctrl+W", "Close the active tab"),
+            ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
+            (
+                "Ctrl+Shift+1–9 / 0",
+                "Select a tab (hold Ctrl+Shift for numbers)",
+            ),
             ("Ctrl+K", "Open global search"),
             ("Alt+Enter", "Open containing folder (global search)"),
         ]);
@@ -596,7 +614,11 @@ const MEDIA: &[(&str, &str)] = &[
     ("Ctrl+Alt+← / →", "Seek −5 / +5 seconds"),
     ("Ctrl+Alt+↑ / ↓", "Volume up / down"),
     ("Ctrl+Alt+M", "Mute / unmute"),
-    ("Ctrl+Alt+< / >", "Previous / next audio file"),
+    ("Ctrl+Alt+< / >", "Previous / next file of the same type"),
+    (
+        "Enter on a video",
+        "Open it in the default app where the preview stopped",
+    ),
 ];
 
 fn default_hint(hint: ContextHint, type_to_search: bool) -> &'static str {
@@ -611,8 +633,11 @@ fn default_hint(hint: ContextHint, type_to_search: bool) -> &'static str {
         ContextHint::Copy => "Ctrl+C",
         ContextHint::Duplicate => "Ctrl+D",
         ContextHint::Paste => "Ctrl+V",
-        ContextHint::MoveTo | ContextHint::CopyTo | ContextHint::Restore => "",
-        ContextHint::Terminal => "Ctrl+T",
+        ContextHint::MoveTo
+        | ContextHint::CopyTo
+        | ContextHint::Restore
+        | ContextHint::RemoveFromRecent => "",
+        ContextHint::Terminal => "Ctrl+Alt+T",
         ContextHint::Trash => "Del",
         ContextHint::PermanentDelete => "Shift+Del",
         ContextHint::Open => "↵",

@@ -33,11 +33,169 @@ pub struct EntrySplice {
     pub entries: Vec<FileEntry>,
 }
 
+pub(crate) type EntrySpliceApplication = Option<(Vec<EntrySplice>, Option<usize>)>;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ColumnEntryCounts {
     pub total: usize,
     pub files: usize,
     pub folders: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SelectedLocations {
+    Explicit(HashSet<Location>),
+    All {
+        excluded: HashSet<Location>,
+        count: usize,
+    },
+}
+
+impl Default for SelectedLocations {
+    fn default() -> Self {
+        Self::Explicit(HashSet::new())
+    }
+}
+
+impl SelectedLocations {
+    fn all_visible(entries: &[FileEntry], show_hidden: bool) -> Self {
+        let excluded = if show_hidden {
+            HashSet::new()
+        } else {
+            entries
+                .iter()
+                .filter(|entry| entry.is_hidden)
+                .map(|entry| entry.location.clone())
+                .collect()
+        };
+        Self::All {
+            count: entries.len().saturating_sub(excluded.len()),
+            excluded,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Explicit(locations) => locations.len(),
+            Self::All { count, .. } => *count,
+        }
+    }
+
+    fn contains(&self, location: &Location) -> bool {
+        match self {
+            Self::Explicit(locations) => locations.contains(location),
+            Self::All { excluded, .. } => !excluded.contains(location),
+        }
+    }
+
+    fn insert(&mut self, location: Location) -> bool {
+        match self {
+            Self::Explicit(locations) => locations.insert(location),
+            Self::All { excluded, count } => {
+                let inserted = excluded.remove(&location);
+                if inserted {
+                    *count = count.saturating_add(1);
+                }
+                inserted
+            }
+        }
+    }
+
+    fn remove(&mut self, location: &Location) -> bool {
+        match self {
+            Self::Explicit(locations) => locations.remove(location),
+            Self::All { excluded, count } => {
+                let removed = excluded.insert(location.clone());
+                if removed {
+                    *count = count.saturating_sub(1);
+                }
+                removed
+            }
+        }
+    }
+
+    fn excludes_new(&mut self, location: Location) {
+        if let Self::All { excluded, .. } = self {
+            excluded.insert(location);
+        }
+    }
+
+    fn relocate(&mut self, from: &Location, to: Location) {
+        match self {
+            Self::Explicit(locations) => {
+                if locations.remove(from) {
+                    locations.insert(to);
+                }
+            }
+            Self::All { excluded, .. } => {
+                if excluded.remove(from) {
+                    excluded.insert(to);
+                }
+            }
+        }
+    }
+
+    fn materialize(&self, entries: &[FileEntry]) -> HashSet<Location> {
+        match self {
+            Self::Explicit(locations) => locations.clone(),
+            Self::All { excluded, .. } => entries
+                .iter()
+                .filter(|entry| !excluded.contains(&entry.location))
+                .map(|entry| entry.location.clone())
+                .collect(),
+        }
+    }
+
+    fn equals_explicit(&self, locations: &HashSet<Location>, entries: &[FileEntry]) -> bool {
+        self.len() == locations.len()
+            && match self {
+                Self::Explicit(selected) => selected == locations,
+                Self::All { excluded, .. } => entries.iter().all(|entry| {
+                    excluded.contains(&entry.location) != locations.contains(&entry.location)
+                }),
+            }
+    }
+
+    fn retain(&mut self, entries: &[FileEntry], hide_hidden: bool) {
+        match self {
+            Self::Explicit(locations) => {
+                let mut previous = std::mem::take(locations);
+                *locations = entries
+                    .iter()
+                    .filter(|entry| !hide_hidden || !entry.is_hidden)
+                    .filter_map(|entry| previous.take(&entry.location))
+                    .collect();
+            }
+            Self::All { excluded, count } => {
+                if hide_hidden {
+                    excluded.extend(
+                        entries
+                            .iter()
+                            .filter(|entry| entry.is_hidden)
+                            .map(|entry| entry.location.clone()),
+                    );
+                }
+                *count = entries
+                    .iter()
+                    .filter(|entry| !excluded.contains(&entry.location))
+                    .count();
+            }
+        }
+    }
+}
+
+impl From<HashSet<Location>> for SelectedLocations {
+    fn from(locations: HashSet<Location>) -> Self {
+        Self::Explicit(locations)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -47,11 +205,12 @@ pub struct ColumnState {
     entry_counts: Cell<Option<(bool, ColumnEntryCounts)>>,
     metadata_positions: Option<HashMap<Location, usize>>,
     pub selected: Option<usize>,
-    selected_locations: HashSet<Location>,
+    selected_locations: SelectedLocations,
     selection_anchor: Option<Location>,
     selection_target: Option<Location>,
     pending_selection: HashSet<Location>,
-    pending_reveal: Option<Location>,
+    pending_reveal: Vec<Location>,
+    selection_from_reveal: bool,
     pub load_state: LoadState,
     pub truncated: bool,
     /// Whether entries here can be moved to Trash, resolved from a listed entry
@@ -215,11 +374,12 @@ impl NavigationState {
                 entry_counts: Cell::new(None),
                 metadata_positions: None,
                 selected: None,
-                selected_locations: HashSet::new(),
+                selected_locations: SelectedLocations::default(),
                 selection_anchor: None,
                 selection_target: None,
                 pending_selection: HashSet::new(),
-                pending_reveal: None,
+                pending_reveal: Vec::new(),
+                selection_from_reveal: false,
                 load_state: LoadState::Loading,
                 truncated: false,
                 can_trash: None,
@@ -290,11 +450,12 @@ impl NavigationState {
             entry_counts: Cell::new(None),
             metadata_positions: None,
             selected: None,
-            selected_locations: HashSet::new(),
+            selected_locations: SelectedLocations::default(),
             selection_anchor: None,
             selection_target: None,
             pending_selection: HashSet::new(),
-            pending_reveal: None,
+            pending_reveal: Vec::new(),
+            selection_from_reveal: false,
             load_state: LoadState::Loading,
             truncated: false,
             can_trash: None,
@@ -311,17 +472,31 @@ impl NavigationState {
         }
     }
 
-    pub fn select_location_on_load(&mut self, depth: usize, location: Location) {
+    pub fn select_locations_on_load(&mut self, depth: usize, targets: Vec<Location>) {
         if let Some(column) = self.columns.get_mut(depth) {
             column.selected = None;
             column.selected_locations.clear();
             column.selection_anchor = None;
             column.selection_target = None;
             column.pending_selection.clear();
-            column.pending_reveal = Some(location);
+            column.pending_reveal = targets;
+            column.selection_from_reveal = false;
             column.select_first_on_load = false;
             column.load_cursor = None;
         }
+    }
+
+    pub fn reveal_pending(&self, depth: usize) -> bool {
+        self.columns
+            .get(depth)
+            .is_some_and(|column| !column.pending_reveal.is_empty())
+    }
+
+    /// Consume the focus request so later publications cannot steal focus again.
+    pub fn take_selection_from_reveal(&mut self, depth: usize) -> bool {
+        self.columns
+            .get_mut(depth)
+            .is_some_and(|column| std::mem::take(&mut column.selection_from_reveal))
     }
 
     pub fn take_resolved_location_reveal(
@@ -333,14 +508,35 @@ impl NavigationState {
         if column.request_id != request_id {
             return None;
         }
-        let target = column.pending_reveal.as_ref()?;
-        let is_hidden = column
+        let requested: HashSet<&Location> = column.pending_reveal.iter().collect();
+        let (mut listed, mut any_hidden) = (0, false);
+        for entry in column
             .entries
             .iter()
-            .find(|entry| &entry.location == target)?
-            .is_hidden;
-        column.pending_reveal = None;
-        Some(is_hidden)
+            .filter(|entry| requested.contains(&entry.location))
+        {
+            listed += 1;
+            any_hidden |= entry.is_hidden;
+        }
+        if listed == 0 {
+            return None;
+        }
+        if listed == requested.len() {
+            column.pending_reveal.clear();
+        }
+        Some(any_hidden)
+    }
+
+    pub fn lists_every_target(&self, depth: usize, targets: &[Location]) -> bool {
+        let requested: HashSet<&Location> = targets.iter().collect();
+        self.columns.get(depth).is_some_and(|column| {
+            column
+                .entries
+                .iter()
+                .filter(|entry| requested.contains(&entry.location))
+                .count()
+                == requested.len()
+        })
     }
 
     pub fn take_unresolved_location_reveal(
@@ -352,7 +548,16 @@ impl NavigationState {
         if column.request_id != request_id {
             return None;
         }
-        column.pending_reveal.take()
+        let targets = std::mem::take(&mut column.pending_reveal);
+        let requested: HashSet<&Location> = targets.iter().collect();
+        if column
+            .entries
+            .iter()
+            .any(|entry| requested.contains(&entry.location))
+        {
+            return None;
+        }
+        targets.into_iter().next()
     }
 
     pub fn apply_batch(
@@ -366,6 +571,16 @@ impl NavigationState {
             .selected
             .and_then(|position| column.entries.get(position))
             .map(|entry| entry.location.clone());
+        if matches!(column.selected_locations, SelectedLocations::All { .. }) {
+            let existing: HashSet<_> = column.entries.iter().map(|entry| &entry.location).collect();
+            for entry in &entries {
+                if !existing.contains(&entry.location) {
+                    column
+                        .selected_locations
+                        .excludes_new(entry.location.clone());
+                }
+            }
+        }
         let (merged, insertions) =
             merge_entries(std::mem::take(&mut column.entries), entries, preferences);
         column.entries = merged;
@@ -543,12 +758,164 @@ impl NavigationState {
             .retain(|location| locations.contains(location));
     }
 
+    pub fn apply_new_entries_batch(
+        &mut self,
+        depth: usize,
+        watched: &Location,
+        entries: Vec<FileEntry>,
+    ) -> Result<EntrySpliceApplication, ()> {
+        let Some(column) = self
+            .columns
+            .get_mut(depth)
+            .filter(|column| &column.location == watched)
+        else {
+            return Err(());
+        };
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let incoming_locations: HashSet<_> =
+            entries.iter().map(|entry| entry.location.clone()).collect();
+        if incoming_locations.len() != entries.len()
+            || column
+                .entries
+                .iter()
+                .any(|entry| incoming_locations.contains(&entry.location))
+        {
+            return Err(());
+        }
+
+        let selected_location = column
+            .selected
+            .and_then(|position| column.entries.get(position))
+            .map(|entry| entry.location.clone());
+        for entry in &entries {
+            column
+                .selected_locations
+                .excludes_new(entry.location.clone());
+        }
+        let (merged, insertions) = merge_entries(
+            std::mem::take(&mut column.entries),
+            entries,
+            column.preferences,
+        );
+        column.entries = merged;
+        column.selected = selected_location.and_then(|location| {
+            column
+                .entries
+                .iter()
+                .position(|entry| entry.location == location)
+        });
+        column.invalidate_entry_indexes();
+        column.load_state = LoadState::Ready;
+        Ok(Some((
+            insertions
+                .into_iter()
+                .map(|insertion| EntrySplice {
+                    position: insertion.position,
+                    removed: 0,
+                    entries: insertion.entries,
+                })
+                .collect(),
+            column.selected,
+        )))
+    }
+
+    pub fn apply_removals_batch(
+        &mut self,
+        depth: usize,
+        watched: &Location,
+        locations: impl IntoIterator<Item = Location>,
+    ) -> EntrySpliceApplication {
+        let column = self
+            .columns
+            .get_mut(depth)
+            .filter(|column| &column.location == watched)?;
+        let removals: HashSet<_> = locations.into_iter().collect();
+        if removals.is_empty() {
+            return None;
+        }
+
+        let selected_position = column.selected;
+        let selected_location = selected_position
+            .and_then(|position| column.entries.get(position))
+            .map(|entry| entry.location.clone());
+        let mut retained = Vec::with_capacity(column.entries.len());
+        let mut removed_locations = Vec::new();
+        let mut splices = Vec::<EntrySplice>::new();
+        let mut retained_before_selected = 0;
+        for (position, entry) in std::mem::take(&mut column.entries).into_iter().enumerate() {
+            if removals.contains(&entry.location) {
+                removed_locations.push(entry.location);
+                let splice_position = retained.len();
+                if let Some(splice) = splices
+                    .last_mut()
+                    .filter(|splice| splice.position == splice_position)
+                {
+                    splice.removed += 1;
+                } else {
+                    splices.push(EntrySplice {
+                        position: splice_position,
+                        removed: 1,
+                        entries: Vec::new(),
+                    });
+                }
+            } else {
+                if selected_position.is_some_and(|selected| position < selected) {
+                    retained_before_selected += 1;
+                }
+                retained.push(entry);
+            }
+        }
+        column.entries = retained;
+        if removed_locations.is_empty() {
+            return None;
+        }
+
+        let selected_was_removed = selected_location
+            .as_ref()
+            .is_some_and(|location| removals.contains(location));
+        let mut replace_selection = false;
+        for location in &removed_locations {
+            let replace = !self.selectionless_removals.remove(location);
+            if selected_location.as_ref() == Some(location) {
+                replace_selection = replace;
+            }
+            column.selected_locations.remove(location);
+        }
+        column.selected = if selected_was_removed {
+            if replace_selection && !column.entries.is_empty() {
+                let position = retained_before_selected.min(column.entries.len() - 1);
+                column
+                    .selected_locations
+                    .insert(column.entries[position].location.clone());
+                Some(position)
+            } else {
+                None
+            }
+        } else {
+            selected_location.and_then(|location| {
+                column
+                    .entries
+                    .iter()
+                    .position(|entry| entry.location == location)
+            })
+        };
+        column.invalidate_entry_indexes();
+        column.load_state = if column.entries.is_empty() {
+            LoadState::Empty
+        } else {
+            LoadState::Ready
+        };
+        Some((splices, column.selected))
+    }
+
     pub fn apply_directory_change(
         &mut self,
         depth: usize,
         watched: &Location,
         change: DirectoryChange,
-    ) -> Option<(Vec<EntrySplice>, Option<usize>)> {
+    ) -> EntrySpliceApplication {
         if !self
             .columns
             .get(depth)
@@ -570,13 +937,17 @@ impl NavigationState {
 
         match change {
             DirectoryChange::Upsert(entry) => {
-                if column
+                let existing = column
                     .entries
                     .iter()
-                    .find(|current| current.location == entry.location)
-                    == Some(&entry)
-                {
+                    .find(|current| current.location == entry.location);
+                if existing == Some(&entry) {
                     return None;
+                }
+                if existing.is_none() {
+                    column
+                        .selected_locations
+                        .excludes_new(entry.location.clone());
                 }
                 upsert_monitored_entry(&mut column.entries, entry, preferences, &mut splices);
             }
@@ -639,9 +1010,9 @@ impl NavigationState {
                 if selected_location.as_ref() == Some(&from) {
                     selected_location = Some(entry.location.clone());
                 }
-                if column.selected_locations.remove(&from) {
-                    column.selected_locations.insert(entry.location.clone());
-                }
+                column
+                    .selected_locations
+                    .relocate(&from, entry.location.clone());
                 for target in [
                     &mut column.selection_target,
                     &mut column.selection_anchor,
@@ -676,6 +1047,21 @@ impl NavigationState {
         Some((splices, column.selected))
     }
 
+    pub fn refresh_column(&mut self, depth: usize, request_id: RequestId) -> Option<Location> {
+        let column = self.columns.get_mut(depth)?;
+        column.selection_target = column
+            .selected
+            .and_then(|position| column.entries.get(position))
+            .map(|entry| entry.location.clone())
+            .or_else(|| column.selection_target.clone());
+        column.pending_selection = column.selected_locations.materialize(&column.entries);
+        column.selected_locations = column.pending_selection.clone().into();
+        column.load_state = LoadState::Loading;
+        column.truncated = false;
+        column.request_id = request_id;
+        Some(column.location.clone())
+    }
+
     pub fn reload_column(&mut self, depth: usize, request_id: RequestId) -> Option<Location> {
         let column = self.columns.get_mut(depth)?;
         column.selection_target = column
@@ -683,7 +1069,8 @@ impl NavigationState {
             .and_then(|position| column.entries.get(position))
             .map(|entry| entry.location.clone())
             .or_else(|| column.selection_target.clone());
-        column.pending_selection = column.selected_locations.clone();
+        column.pending_selection = column.selected_locations.materialize(&column.entries);
+        column.selected_locations = column.pending_selection.clone().into();
         column.entries = Vec::new();
         column.invalidate_entry_indexes();
         column.selected = None;
@@ -701,10 +1088,11 @@ impl NavigationState {
         };
         let column = &mut self.columns[depth];
         column.selected_locations = column
-            .selected_locations
+            .pending_selection
             .iter()
             .filter_map(|selected| selected.rebase(&previous, &location))
-            .collect();
+            .collect::<HashSet<_>>()
+            .into();
         column.pending_selection = column
             .pending_selection
             .iter()
@@ -714,12 +1102,16 @@ impl NavigationState {
             &mut column.selection_target,
             &mut column.selection_anchor,
             &mut column.load_cursor,
-            &mut column.pending_reveal,
         ] {
             *target = target
                 .as_ref()
                 .and_then(|target| target.rebase(&previous, &location));
         }
+        column.pending_reveal = column
+            .pending_reveal
+            .iter()
+            .filter_map(|target| target.rebase(&previous, &location))
+            .collect();
         column.location = location;
     }
 
@@ -793,9 +1185,7 @@ impl NavigationState {
         column.preferences = preferences;
         column.metadata_positions = None;
         if preferences.sort_key != SortKey::DeviceOrder {
-            column
-                .entries
-                .sort_unstable_by(|left, right| compare_entries(left, right, preferences));
+            column.entries = sort_entries(std::mem::take(&mut column.entries), preferences);
         }
         column.selected = selected_location.and_then(|location| {
             column
@@ -852,6 +1242,7 @@ impl NavigationState {
     ) -> Option<usize> {
         let (depth, column) = self.column_for_request_mut(request_id)?;
         column.select_first_on_load = false;
+        column.retain_selected_locations(false);
         column.pending_selection.clear();
         column.truncated = truncated;
         column.can_trash = can_trash;
@@ -866,7 +1257,8 @@ impl NavigationState {
 
     pub fn fail(&mut self, request_id: RequestId, message: String) -> Option<usize> {
         let (depth, column) = self.column_for_request_mut(request_id)?;
-        column.pending_reveal = None;
+        column.pending_reveal.clear();
+        column.selection_from_reveal = false;
         column.load_state = LoadState::Error(message);
         Some(depth)
     }
@@ -954,10 +1346,11 @@ impl NavigationState {
         };
         let location = column.entries[position].location.clone();
         let filled = column.load_cursor.is_none() && column.selected_locations.contains(&location);
+        column.pending_reveal.clear();
+        column.selection_from_reveal = false;
         if column.load_cursor.is_some() {
             column.selected_locations.clear();
             column.load_cursor = None;
-            column.pending_reveal = None;
         }
         if filled {
             column.selected_locations.remove(&location);
@@ -970,6 +1363,25 @@ impl NavigationState {
 
     pub fn select_visible(&mut self, depth: usize) -> Option<(usize, Vec<usize>)> {
         self.replace_visible(depth, true)
+    }
+
+    pub fn select_all(&mut self, depth: usize) -> Option<usize> {
+        self.visual = None;
+        self.selection_commit = false;
+        let column = self.columns.get_mut(depth)?;
+        let show_hidden = column.preferences.show_hidden;
+        let focused = column
+            .entries
+            .iter()
+            .rposition(|entry| show_hidden || !entry.is_hidden)?;
+        column.selected_locations = SelectedLocations::all_visible(&column.entries, show_hidden);
+        column.selected = Some(focused);
+        column.selection_anchor = Some(column.entries[focused].location.clone());
+        column.load_cursor = None;
+        column.pending_reveal.clear();
+        column.selection_from_reveal = false;
+        self.active_column = Some(depth);
+        Some(focused)
     }
 
     pub fn invert_visible(&mut self, depth: usize) -> Option<(usize, Vec<usize>)> {
@@ -1050,17 +1462,18 @@ impl NavigationState {
         let cursor = column
             .selected
             .filter(|position| order.contains(position))?;
+        column.pending_reveal.clear();
+        column.selection_from_reveal = false;
         if column.load_cursor.is_some() {
             column.selected_locations.clear();
             column.load_cursor = None;
-            column.pending_reveal = None;
         }
         self.visual = Some(VisualRange {
             depth,
             directory: column.location.clone(),
             anchor: column.entries[cursor].location.clone(),
             kind,
-            base: column.selected_locations.clone(),
+            base: column.selected_locations.materialize(&column.entries),
             toggled: HashSet::new(),
         });
         self.refresh_visual(Some(&order))
@@ -1202,7 +1615,10 @@ impl NavigationState {
                 })
             });
         if !self.selection_commit
-            && (column.selected_locations == locations || cursor_only_outside_fill)
+            && (column
+                .selected_locations
+                .equals_explicit(&locations, &column.entries)
+                || cursor_only_outside_fill)
             && column
                 .selected
                 .is_some_and(|cursor| cursor < column.entries.len())
@@ -1815,10 +2231,14 @@ fn focus_only(column: &mut ColumnState, position: usize) {
 fn place_cursor(column: &mut ColumnState, position: usize) -> bool {
     let moved = column.selected != Some(position);
     let mut cleared = false;
+    if moved {
+        // A resolved reveal still waiting for more batches must not pull the cursor back.
+        column.pending_reveal.clear();
+        column.selection_from_reveal = false;
+    }
     if moved && column.load_cursor.is_some() {
         column.selected_locations.clear();
         column.load_cursor = None;
-        column.pending_reveal = None;
         cleared = true;
     }
     column.selected = Some(position);
@@ -1884,15 +2304,7 @@ impl ColumnState {
         if self.selected_locations.is_empty() {
             return;
         }
-        // Move the retained keys rather than cloning paths or scanning the directory
-        // separately for every selected item after Select All.
-        let mut previous = std::mem::take(&mut self.selected_locations);
-        self.selected_locations = self
-            .entries
-            .iter()
-            .filter(|entry| !hide_hidden || !entry.is_hidden)
-            .filter_map(|entry| previous.take(&entry.location))
-            .collect();
+        self.selected_locations.retain(&self.entries, hide_hidden);
     }
 
     fn single_selected_position(&self) -> Option<usize> {
@@ -1905,22 +2317,31 @@ impl ColumnState {
     }
 
     fn resolve_pending_reveal(&mut self) {
-        let Some(target) = self.pending_reveal.as_ref() else {
+        if self.pending_reveal.is_empty() {
             return;
-        };
-        let Some(position) = self
+        }
+        let requested: HashSet<&Location> = self.pending_reveal.iter().collect();
+        let listed: HashMap<&Location, usize> = self
             .entries
             .iter()
-            .position(|entry| &entry.location == target)
+            .enumerate()
+            .filter(|(_, entry)| requested.contains(&entry.location))
+            .map(|(position, entry)| (&entry.location, position))
+            .collect();
+        let Some((position, first)) = self
+            .pending_reveal
+            .iter()
+            .find_map(|target| Some((*listed.get(target)?, target.clone())))
         else {
             return;
         };
-        let target = target.clone();
+        let selected: HashSet<Location> = listed.into_keys().cloned().collect();
         self.selected = Some(position);
-        self.selected_locations = HashSet::from([target.clone()]);
-        self.selection_anchor = Some(target);
+        self.selected_locations = selected.into();
+        self.selection_anchor = Some(first);
         self.selection_target = None;
         self.load_cursor = None;
+        self.selection_from_reveal = true;
     }
 
     fn restore_pending_selection(&mut self) {
@@ -1936,7 +2357,7 @@ impl ColumnState {
         if restored.is_empty() {
             return;
         }
-        self.selected_locations = restored;
+        self.selected_locations = restored.into();
         if self.selected.is_none() {
             self.selected = self
                 .entries
@@ -1949,9 +2370,10 @@ impl ColumnState {
 fn adopt_selected_locations(column: &mut ColumnState, locations: HashSet<Location>, commit: bool) {
     if commit {
         column.load_cursor = None;
-        column.pending_reveal = None;
+        column.pending_reveal.clear();
+        column.selection_from_reveal = false;
     }
-    column.selected_locations = locations;
+    column.selected_locations = locations.into();
 }
 
 fn apply_metadata_update(entry: &mut FileEntry, update: &MetadataUpdate) -> bool {
@@ -2005,7 +2427,7 @@ fn preferences_for_location(
 
 fn merge_entries(
     mut existing: Vec<FileEntry>,
-    mut incoming: Vec<FileEntry>,
+    incoming: Vec<FileEntry>,
     preferences: ViewPreferences,
 ) -> (Vec<FileEntry>, Vec<EntryInsertion>) {
     if preferences.sort_key == SortKey::DeviceOrder {
@@ -2013,36 +2435,49 @@ fn merge_entries(
             position: existing.len(),
             entries: incoming.clone(),
         };
-        existing.append(&mut incoming);
+        existing.extend(incoming);
         return (existing, vec![insertion]);
     }
-    incoming.sort_unstable_by(|left, right| compare_entries(left, right, preferences));
+    let precompute_type = preferences.sort_key == SortKey::Type;
+    let mut incoming_items: Vec<SortItem> = incoming
+        .into_iter()
+        .map(|entry| SortItem::new(entry, precompute_type))
+        .collect();
+    incoming_items.sort_unstable_by(|left, right| compare_sort_items(left, right, preferences));
     if existing.is_empty() {
+        let incoming_entries: Vec<FileEntry> =
+            incoming_items.into_iter().map(|item| item.entry).collect();
         let insertion = EntryInsertion {
             position: 0,
-            entries: incoming.clone(),
+            entries: incoming_entries.clone(),
         };
-        return (incoming, vec![insertion]);
+        return (incoming_entries, vec![insertion]);
     }
 
-    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
-    let mut existing = existing.drain(..).peekable();
-    let mut incoming = incoming.into_iter().peekable();
+    let existing_count = existing.len();
+    let incoming_count = incoming_items.len();
+    let mut existing_items = existing
+        .into_iter()
+        .map(|entry| SortItem::new(entry, precompute_type))
+        .peekable();
+    let mut incoming_items = incoming_items.into_iter().peekable();
+    let mut merged = Vec::with_capacity(existing_count + incoming_count);
     let mut insertions = Vec::<EntryInsertion>::new();
 
-    while existing.peek().is_some() || incoming.peek().is_some() {
-        let take_incoming = match (existing.peek(), incoming.peek()) {
+    while existing_items.peek().is_some() || incoming_items.peek().is_some() {
+        let take_incoming = match (existing_items.peek(), incoming_items.peek()) {
             (Some(left), Some(right)) => {
-                compare_entries(right, left, preferences) != Ordering::Greater
+                compare_sort_items(right, left, preferences) != Ordering::Greater
             }
             (None, Some(_)) => true,
             _ => false,
         };
 
         if take_incoming {
-            let Some(entry) = incoming.next() else {
+            let Some(item) = incoming_items.next() else {
                 break;
             };
+            let entry = item.entry;
             let position = merged.len();
             if let Some(insertion) = insertions
                 .last_mut()
@@ -2056,8 +2491,8 @@ fn merge_entries(
                 });
             }
             merged.push(entry);
-        } else if let Some(entry) = existing.next() {
-            merged.push(entry);
+        } else if let Some(item) = existing_items.next() {
+            merged.push(item.entry);
         }
     }
 
@@ -2065,13 +2500,130 @@ fn merge_entries(
 }
 
 pub(crate) fn sort_entries(
-    mut entries: Vec<FileEntry>,
+    entries: Vec<FileEntry>,
     preferences: ViewPreferences,
 ) -> Vec<FileEntry> {
-    if preferences.sort_key != SortKey::DeviceOrder {
-        entries.sort_unstable_by(|left, right| compare_entries(left, right, preferences));
+    if preferences.sort_key == SortKey::DeviceOrder || entries.len() <= 1 {
+        return entries;
     }
-    entries
+    let precompute_type = preferences.sort_key == SortKey::Type;
+    let mut items: Vec<SortItem> = entries
+        .into_iter()
+        .map(|entry| SortItem::new(entry, precompute_type))
+        .collect();
+
+    items.sort_unstable_by(|left, right| compare_sort_items(left, right, preferences));
+
+    items.into_iter().map(|item| item.entry).collect()
+}
+
+enum FoldedName {
+    Ascii,
+    Folded(glib::GString),
+}
+
+impl FoldedName {
+    fn new(name: &str) -> Self {
+        if name.is_ascii() {
+            Self::Ascii
+        } else {
+            Self::Folded(glib::casefold(name))
+        }
+    }
+
+    fn as_bytes<'a>(&'a self, raw: &'a str) -> &'a [u8] {
+        match self {
+            Self::Ascii => raw.as_bytes(),
+            Self::Folded(folded) => folded.as_bytes(),
+        }
+    }
+}
+
+fn compare_with_folded(
+    left_folded: &FoldedName,
+    left_raw: &str,
+    right_folded: &FoldedName,
+    right_raw: &str,
+) -> Ordering {
+    natural_compare(
+        left_folded.as_bytes(left_raw),
+        right_folded.as_bytes(right_raw),
+    )
+    .then_with(|| left_raw.cmp(right_raw))
+}
+
+struct SortItem {
+    entry: FileEntry,
+    folded_name: FoldedName,
+    entry_type: Option<crate::services::EntryType>,
+}
+
+impl SortItem {
+    fn new(entry: FileEntry, precompute_type: bool) -> Self {
+        let folded_name = FoldedName::new(&entry.display_name);
+        let entry_type = precompute_type.then(|| crate::services::entry_type(&entry));
+        Self {
+            entry,
+            folded_name,
+            entry_type,
+        }
+    }
+}
+
+fn compare_sort_items(left: &SortItem, right: &SortItem, preferences: ViewPreferences) -> Ordering {
+    if preferences.sort_key == SortKey::DeviceOrder {
+        return Ordering::Equal;
+    }
+    if preferences.folders_first {
+        let directory_order = right.entry.is_directory().cmp(&left.entry.is_directory());
+        if directory_order != Ordering::Equal {
+            return directory_order;
+        }
+    }
+
+    let ordering = match preferences.sort_key {
+        SortKey::DeviceOrder => Ordering::Equal,
+        SortKey::Recency => compare_metadata(
+            &left.entry.recent_unix_seconds,
+            &right.entry.recent_unix_seconds,
+        ),
+        SortKey::Name => compare_with_folded(
+            &left.folded_name,
+            &left.entry.display_name,
+            &right.folded_name,
+            &right.entry.display_name,
+        ),
+        SortKey::Type => {
+            let left_type = left
+                .entry_type
+                .as_ref()
+                .expect("Type sorting precomputes entry types");
+            let right_type = right
+                .entry_type
+                .as_ref()
+                .expect("Type sorting precomputes entry types");
+            compare_entry_type_values(left_type, right_type)
+        }
+        SortKey::Size => compare_metadata(&left.entry.size, &right.entry.size),
+        SortKey::Modified => compare_metadata(
+            &left.entry.modified_unix_seconds,
+            &right.entry.modified_unix_seconds,
+        ),
+    };
+    let ordering = match preferences.sort_direction {
+        SortDirection::Ascending => ordering,
+        SortDirection::Descending => ordering.reverse(),
+    };
+    ordering
+        .then_with(|| {
+            compare_with_folded(
+                &left.folded_name,
+                &left.entry.display_name,
+                &right.folded_name,
+                &right.entry.display_name,
+            )
+        })
+        .then_with(|| left.entry.location.compare(&right.entry.location))
 }
 
 fn remove_monitored_entry(
@@ -2154,10 +2706,18 @@ fn compare_entries(left: &FileEntry, right: &FileEntry, preferences: ViewPrefere
         }
     }
 
+    let left_folded = FoldedName::new(&left.display_name);
+    let right_folded = FoldedName::new(&right.display_name);
+
     let ordering = match preferences.sort_key {
         SortKey::DeviceOrder => Ordering::Equal,
         SortKey::Recency => compare_metadata(&left.recent_unix_seconds, &right.recent_unix_seconds),
-        SortKey::Name => compare_display_names(&left.display_name, &right.display_name),
+        SortKey::Name => compare_with_folded(
+            &left_folded,
+            &left.display_name,
+            &right_folded,
+            &right.display_name,
+        ),
         SortKey::Type => compare_entry_types(left, right),
         SortKey::Size => compare_metadata(&left.size, &right.size),
         SortKey::Modified => {
@@ -2169,15 +2729,29 @@ fn compare_entries(left: &FileEntry, right: &FileEntry, preferences: ViewPrefere
         SortDirection::Descending => ordering.reverse(),
     };
     ordering
-        .then_with(|| compare_display_names(&left.display_name, &right.display_name))
+        .then_with(|| {
+            compare_with_folded(
+                &left_folded,
+                &left.display_name,
+                &right_folded,
+                &right.display_name,
+            )
+        })
         .then_with(|| left.location.compare(&right.location))
 }
 
 fn compare_entry_types(left: &FileEntry, right: &FileEntry) -> Ordering {
-    use crate::services::EntryType;
     let left_type = crate::services::entry_type(left);
     let right_type = crate::services::entry_type(right);
-    match (&left_type, &right_type) {
+    compare_entry_type_values(&left_type, &right_type)
+}
+
+fn compare_entry_type_values(
+    left_type: &crate::services::EntryType,
+    right_type: &crate::services::EntryType,
+) -> Ordering {
+    use crate::services::EntryType;
+    match (left_type, right_type) {
         (EntryType::Other, EntryType::Other) => Ordering::Equal,
         (EntryType::Other, _) => Ordering::Greater,
         (_, EntryType::Other) => Ordering::Less,
@@ -2186,14 +2760,9 @@ fn compare_entry_types(left: &FileEntry, right: &FileEntry) -> Ordering {
 }
 
 pub(crate) fn compare_display_names(left: &str, right: &str) -> Ordering {
-    if left.is_ascii() && right.is_ascii() {
-        natural_compare(left.as_bytes(), right.as_bytes())
-    } else {
-        let left_folded = glib::casefold(left);
-        let right_folded = glib::casefold(right);
-        natural_compare(left_folded.as_bytes(), right_folded.as_bytes())
-    }
-    .then_with(|| left.cmp(right))
+    let left_folded = FoldedName::new(left);
+    let right_folded = FoldedName::new(right);
+    compare_with_folded(&left_folded, left, &right_folded, right)
 }
 
 fn natural_compare(left: &[u8], right: &[u8]) -> Ordering {

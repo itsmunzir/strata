@@ -31,6 +31,7 @@ fn named_entry(path: &str, name: &str) -> FileEntry {
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        recent_uri: None,
     }
 }
 
@@ -702,6 +703,28 @@ fn a_rename_rebases_the_pending_selection_during_a_refresh() {
 }
 
 #[test]
+fn a_rename_rebases_every_pending_reveal_target() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home/old"), RequestId(1));
+    state.select_locations_on_load(0, vec![location("/home/old/b"), location("/home/old/a")]);
+
+    state.relocate_column(0, location("/home/new"), RequestId(2));
+    state.install_snapshot(
+        RequestId(2),
+        vec![
+            named_entry("/home/new/a", "a"),
+            named_entry("/home/new/b", "b"),
+        ],
+    );
+
+    assert_eq!(state.selected_positions(0), [0, 1]);
+    assert_eq!(
+        state.focused_entry().expect("focused entry").2.location,
+        location("/home/new/b")
+    );
+}
+
+#[test]
 fn external_moves_rebase_open_descendant_locations() {
     let mut state = NavigationState::default();
     state.navigate(location("/home"), RequestId(1));
@@ -973,6 +996,7 @@ fn hidden_entry(path: &str, name: &str) -> FileEntry {
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        recent_uri: None,
     }
 }
 
@@ -1556,6 +1580,7 @@ fn file_entry(path: &str, name: &str) -> FileEntry {
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        recent_uri: None,
     }
 }
 
@@ -1839,6 +1864,7 @@ fn typed_entry(name: &str, kind: EntryKind) -> FileEntry {
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        recent_uri: None,
     }
 }
 
@@ -2087,6 +2113,24 @@ fn space_adds_a_load_cursor_then_moves_without_rewriting_the_fill() {
             .iter()
             .all(|entry| entry.display_name != "charlie")
     );
+}
+
+#[test]
+fn compact_select_all_excludes_entries_that_arrive_later() {
+    let mut state = NavigationState::default();
+    listing_without_a_load_cursor(&mut state);
+
+    assert_eq!(state.select_all(0), Some(2));
+    assert_eq!(state.selected_count(), 3);
+    state.apply_batch(
+        RequestId(1),
+        vec![named_entry("/fixture/aardvark", "aardvark")],
+    );
+
+    assert_eq!(state.selected_count(), 3);
+    assert_eq!(state.selected_positions(0), [1, 2, 3]);
+    assert_eq!(state.toggle_cursor_fill(), CursorToggle::Removed);
+    assert_eq!(state.selected_positions(0), [1, 2]);
 }
 
 #[test]
@@ -2397,4 +2441,130 @@ fn visual_ranges_end_without_an_anchor_listing_or_pointer_commit() {
     state.navigate(location("/elsewhere"), RequestId(4));
     assert_eq!(state.visual_kind(), None);
     assert_eq!(state.refresh_visual(None), None);
+}
+
+#[test]
+fn precomputed_sort_preserves_natural_utf8_order() {
+    let names = vec![
+        "über_10.txt",
+        "über_2.txt",
+        "Straße_1.txt",
+        "STRASSE_2.txt",
+        "café_latte.txt",
+        "café.txt",
+        "apple.txt",
+        "Banana.txt",
+    ];
+    let entries: Vec<FileEntry> = names
+        .into_iter()
+        .map(|name| file_entry(&format!("/test/{name}"), name))
+        .collect();
+
+    let sorted = super::sort_entries(entries, ViewPreferences::default());
+    let sorted_names: Vec<&str> = sorted.iter().map(|e| e.display_name.as_str()).collect();
+
+    assert_eq!(
+        sorted_names,
+        vec![
+            "apple.txt",
+            "Banana.txt",
+            "café.txt",
+            "café_latte.txt",
+            "Straße_1.txt",
+            "STRASSE_2.txt",
+            "über_2.txt",
+            "über_10.txt",
+        ]
+    );
+}
+
+#[test]
+fn keyed_sort_and_batch_merge_match_monitor_order() {
+    let entries: Vec<_> = [
+        "ß.txt",
+        "ss.txt",
+        "İ.txt",
+        "i.txt",
+        "中文10.txt",
+        "中文2.txt",
+        "FILE.txt",
+        "file.txt",
+        "file02.txt",
+        "file2.txt",
+        "café.png",
+        "über.rs",
+        "unknown.strata-unknown-extension",
+        "same.txt",
+        "same.txt",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, name)| {
+        let mut entry = file_entry(&format!("/fixture/{index}/{name}"), name);
+        if index % 4 == 0 {
+            entry.kind = EntryKind::Directory;
+        }
+        entry.size = match index % 4 {
+            0 => MetadataValue::Unknown,
+            1 => MetadataValue::Unavailable,
+            _ => MetadataValue::Known(10),
+        };
+        entry.modified_unix_seconds = match index % 3 {
+            0 => MetadataValue::Known(20),
+            1 => MetadataValue::Known(10),
+            _ => MetadataValue::Unavailable,
+        };
+        entry.recent_unix_seconds = entry.modified_unix_seconds.clone();
+        entry
+    })
+    .collect();
+
+    for sort_key in [
+        SortKey::Name,
+        SortKey::Type,
+        SortKey::Size,
+        SortKey::Modified,
+        SortKey::Recency,
+        SortKey::DeviceOrder,
+    ] {
+        for sort_direction in [SortDirection::Ascending, SortDirection::Descending] {
+            for folders_first in [false, true] {
+                let preferences = ViewPreferences {
+                    sort_key,
+                    sort_direction,
+                    folders_first,
+                    ..ViewPreferences::default()
+                };
+                let mut expected = entries.clone();
+                expected.sort_by(|left, right| compare_entries(left, right, preferences));
+                assert_eq!(super::sort_entries(entries.clone(), preferences), expected);
+
+                let mut merged = Vec::new();
+                for batch in entries.chunks(4) {
+                    let before = merged.clone();
+                    let (next, insertions) =
+                        super::merge_entries(merged, batch.to_vec(), preferences);
+                    let mut replayed = before;
+                    for insertion in insertions {
+                        replayed.splice(insertion.position..insertion.position, insertion.entries);
+                    }
+                    assert_eq!(replayed, next);
+                    merged = next;
+                }
+                assert_eq!(merged, expected);
+
+                let mut monitored = Vec::new();
+                let mut splices = Vec::new();
+                for entry in &entries {
+                    super::insert_monitored_entry(
+                        &mut monitored,
+                        entry.clone(),
+                        preferences,
+                        &mut splices,
+                    );
+                }
+                assert_eq!(monitored, expected);
+            }
+        }
+    }
 }

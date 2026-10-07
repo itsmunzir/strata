@@ -206,6 +206,13 @@ impl ArchiveFormat {
             None
         }
     }
+
+    pub fn for_entry(entry: &FileEntry) -> Option<Self> {
+        if !entry.is_file() || entry.location.native_path().is_none() {
+            return None;
+        }
+        Self::from_extension(&entry.display_name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +242,13 @@ pub struct CancelledOperation {
     pub failed: Vec<Location>,
     pub not_attempted: Vec<Location>,
     pub affected_locations: HashSet<Location>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordFailure {
+    Required,
+    /// Includes ambiguous decryption failures that may instead indicate damaged data.
+    Incorrect,
 }
 
 #[derive(Clone, Debug)]
@@ -285,7 +299,7 @@ pub enum OperationEvent {
         request_id: OperationRequestId,
         completed: usize,
         total: usize,
-        deleted_location: Option<Location>,
+        deleted_locations: Vec<Location>,
     },
     RestoreProgress {
         request_id: OperationRequestId,
@@ -329,6 +343,7 @@ pub enum OperationEvent {
     Failed {
         request_id: OperationRequestId,
         message: String,
+        password_failure: Option<PasswordFailure>,
     },
     Compressed {
         request_id: OperationRequestId,

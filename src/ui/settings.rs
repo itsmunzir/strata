@@ -13,8 +13,9 @@ use gtk::{gdk, gio, glib, prelude::*, subclass::prelude::*};
 use crate::{
     assets::icons,
     services::{
-        self, BuildKind, Channel, DocumentBlock, InstallRequest, InstallSource, ManagedInstall,
-        ReleaseMetadata, ReleaseNotes, UpdateCheck, UpdateInstall, UpdateMethod, Version,
+        self, BuildKind, Channel, DocumentBlock, InstallCancel, InstallRequest, InstallSource,
+        ManagedInstall, ReleaseMetadata, ReleaseNotes, UpdateCheck, UpdateInstall, UpdateMethod,
+        Version,
     },
 };
 
@@ -24,6 +25,7 @@ mod tests;
 mod about;
 mod actions;
 mod bindings;
+mod exclusions;
 mod general;
 mod search;
 mod theme;
@@ -34,14 +36,11 @@ use general::general_page;
 use theme::theme_page;
 
 use super::{
-    blur::BlurBin,
-    browser::{dismiss_modal_layer, modal_layer},
-    controls::modal_layout,
-    preferences::PreferenceManager,
-    terminal,
+    blur::BlurBin, browser::dismiss_modal_layer, controls::modal_layout,
+    modal::modal_layer_with_backdrop, preferences::PreferenceManager, terminal,
 };
 
-type AvailableUpdate = (ReleaseMetadata, String, UpdateMethod);
+type AvailableUpdate = (ReleaseMetadata, InstallRequest, UpdateMethod);
 type CachedUpdate = Option<AvailableUpdate>;
 pub(super) type UpdateNoticeHandler = Rc<dyn Fn(CachedUpdate)>;
 type WeakUpdateNoticeHandler = Weak<dyn Fn(CachedUpdate)>;
@@ -51,6 +50,16 @@ struct UpdateCheckRow {
     run_check: Rc<dyn Fn(bool)>,
     responsive_action: (gtk::Box, gtk::Button),
     install_underway: Rc<dyn Fn() -> bool>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tests read the row's status text")
+    )]
+    status: gtk::Label,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tests seed and inspect the cached install offer")
+    )]
+    pending_download: Rc<RefCell<Option<PendingInstall>>>,
 }
 
 struct ResponsiveContent {
@@ -70,6 +79,37 @@ pub struct ResponsiveActivationRow {
 /// process-wide guard, separate windows could replace the executable at the
 /// same time. See [`start_install`].
 pub(super) type InstallGuard = Rc<Cell<bool>>;
+
+const RESTART_GRACE_SECONDS: u64 = 20;
+// Must outlast the restart waiter's recovery window.
+const ROLLBACK_RETENTION: Duration = Duration::from_secs(60);
+
+pub(crate) fn schedule_rollback_cleanup() {
+    let Ok(current_exe) = services::installed_executable() else {
+        return;
+    };
+    let Some(rollback) = current_exe.parent().map(services::rollback_path) else {
+        return;
+    };
+    use std::os::unix::fs::MetadataExt;
+    let Ok(preserved) = std::fs::symlink_metadata(&rollback) else {
+        return;
+    };
+    if !preserved.is_file() {
+        return;
+    }
+    glib::timeout_add_local_once(ROLLBACK_RETENTION, move || {
+        // A later install owns its own rollback copy, even in this process.
+        if !std::fs::symlink_metadata(&rollback).is_ok_and(|current| {
+            current.dev() == preserved.dev() && current.ino() == preserved.ino()
+        }) {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(&rollback) {
+            tracing::warn!(%error, "could not remove the preserved previous version");
+        }
+    });
+}
 
 thread_local! {
     static INSTALL_GUARD: InstallGuard = Rc::new(Cell::new(false));
@@ -91,6 +131,13 @@ thread_local! {
 /// happening to still hold a strong reference.
 pub(super) fn install_guard() -> InstallGuard {
     INSTALL_GUARD.with(|guard| guard.clone())
+}
+
+type InstallLauncher =
+    Rc<dyn Fn(InstallRequest, InstallCancel) -> std::sync::mpsc::Receiver<UpdateInstall>>;
+
+fn default_install_launcher() -> InstallLauncher {
+    Rc::new(services::install_update)
 }
 
 thread_local! {
@@ -220,12 +267,8 @@ fn complete_due_update_check(
         return;
     }
     LAST_COMPLETED_CHECK.set(Some(Instant::now()));
-    if let UpdateCheck::Available {
-        release,
-        download_url,
-    } = result
-    {
-        publish_update_notice(Some((release, download_url, method)));
+    if let UpdateCheck::Available { release, install } = result {
+        publish_update_notice(Some((release, install, method)));
     }
 }
 
@@ -513,7 +556,9 @@ fn reflow_settings(
             .last_child()
             .is_some_and(|child| child.is::<gtk::Switch>());
         // Short numeric controls can stay beside wrapping copy after other rows stack.
-        let stack_row = if row.has_css_class("settings-renderer-row") {
+        let stack_row = if row.has_css_class("settings-renderer-row")
+            || row.has_css_class("settings-exclusions-row")
+        {
             true
         } else if row.has_css_class("settings-text-size-row") {
             stack_text_size
@@ -886,6 +931,7 @@ fn updates_page(
         run_check,
         responsive_action,
         install_underway,
+        ..
     } = update_check_row(
         manager.clone(),
         available_notes.clone(),
@@ -1397,14 +1443,6 @@ fn is_stale_check(result_generation: u64, current_generation: u64) -> bool {
     result_generation != current_generation
 }
 
-/// An update that a completed check offered and that the next click will
-/// install, held with the [`BuildKind`] it was offered as.
-///
-/// The kind is what lets the click re-test the offer against the channel
-/// preference in force *then* rather than when the check ran -- see
-/// [`offer_still_eligible`]. It is kept here, beside the request, rather
-/// than on [`InstallRequest`], which deliberately carries nothing but the
-/// URL the installer actually uses.
 struct PendingInstall {
     kind: BuildKind,
     returns_to_stable: bool,
@@ -1443,6 +1481,22 @@ fn update_check_row(
     available_notes: ReleaseNotesCard,
     install_guard: InstallGuard,
     update_method: UpdateMethod,
+) -> UpdateCheckRow {
+    update_check_row_with(
+        manager,
+        available_notes,
+        install_guard,
+        update_method,
+        default_install_launcher(),
+    )
+}
+
+fn update_check_row_with(
+    manager: Rc<PreferenceManager>,
+    available_notes: ReleaseNotesCard,
+    install_guard: InstallGuard,
+    update_method: UpdateMethod,
+    launcher: InstallLauncher,
 ) -> UpdateCheckRow {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
     row.add_css_class("settings-option");
@@ -1498,6 +1552,7 @@ fn update_check_row(
     // Set once an install finishes, so the next click restarts instead of re-checking.
     let installed = Rc::new(Cell::new(false));
     let installing = Rc::new(Cell::new(false));
+    let cancel_handle = Rc::new(RefCell::new(None::<InstallCancel>));
     let install_underway: Rc<dyn Fn() -> bool> = Rc::new({
         let installed = installed.clone();
         let installing = installing.clone();
@@ -1620,23 +1675,15 @@ fn update_check_row(
                             .container
                             .set_visible(shows_available_release_notes(&result));
                         match &result {
-                            UpdateCheck::Available {
-                                release,
-                                download_url,
-                            } => publish_update_notice(Some((
-                                release.clone(),
-                                download_url.clone(),
-                                update_method,
-                            ))),
+                            UpdateCheck::Available { release, install } => publish_update_notice(
+                                Some((release.clone(), install.clone(), update_method)),
+                            ),
                             UpdateCheck::UpToDate | UpdateCheck::Failed(_) => {
                                 publish_update_notice(None)
                             }
                         }
                         match &result {
-                            UpdateCheck::Available {
-                                release,
-                                download_url,
-                            } => {
+                            UpdateCheck::Available { release, install } => {
                                 show_release_notes(&available_notes, release);
                                 if update_method.is_package_managed() {
                                     managed_update_available.set(true);
@@ -1650,9 +1697,7 @@ fn update_check_row(
                                     *pending_download.borrow_mut() = Some(PendingInstall {
                                         kind: release.kind,
                                         returns_to_stable,
-                                        request: InstallRequest {
-                                            download_url: download_url.clone(),
-                                        },
+                                        request: install.clone(),
                                     });
                                     button.set_label(if returns_to_stable {
                                         "Return to stable"
@@ -1686,6 +1731,8 @@ fn update_check_row(
     });
 
     let clicked_check = run_check.clone();
+    let row_status = status.clone();
+    let row_pending_download = pending_download.clone();
     button.connect_clicked(move |button| {
         if update_method == UpdateMethod::Aur && managed_update_available.get() {
             match launch_aur_update() {
@@ -1705,7 +1752,18 @@ fn update_check_row(
             restart_application(button);
             return;
         }
-        if let Some(pending) = pending_download.borrow_mut().take() {
+        if let Some(cancel) = cancel_handle.borrow_mut().take() {
+            status.set_text(if cancel.cancel() {
+                "Cancelling…"
+            } else {
+                FINALIZING_STATUS
+            });
+            button.set_sensitive(false);
+            return;
+        }
+        // Both branches can reborrow this cell; an `if let` scrutinee would retain the RefMut.
+        let pending = pending_download.take();
+        if let Some(pending) = pending {
             if !offer_still_eligible(manager.release_channel(), pending.kind) {
                 // The channel was switched back to Stable -- possibly from
                 // another window, which this row never hears about -- after
@@ -1733,9 +1791,10 @@ fn update_check_row(
             progress.set_fraction(0.0);
             progress.set_visible(true);
             progress.remove_css_class("error");
-            button.set_sensitive(false);
+            button.set_label("Cancel");
             let progress_for_progress = progress.clone();
             let status_for_progress = status.clone();
+            let button_for_progress = button.clone();
             let checking_for_installed = checking.clone();
             let status_for_installed = status.clone();
             let button_for_installed = button.clone();
@@ -1745,13 +1804,26 @@ fn update_check_row(
             let status_for_failed = status.clone();
             let button_for_failed = button.clone();
             let progress_for_failed = progress.clone();
+            let cancel_for_installed = cancel_handle.clone();
+            let cancel_for_cancelled = cancel_handle.clone();
+            let cancel_for_failed = cancel_handle.clone();
+            let checking_for_cancelled = checking.clone();
+            let installing_for_cancelled = installing.clone();
+            let status_for_cancelled = status.clone();
+            let button_for_cancelled = button.clone();
+            let progress_for_cancelled = progress.clone();
             let started = start_install(
                 &install_guard,
                 request,
+                &launcher,
                 move |event| {
+                    if matches!(event, InstallProgress::Finalizing) {
+                        button_for_progress.set_sensitive(false);
+                    }
                     apply_install_progress(&status_for_progress, &progress_for_progress, event)
                 },
                 move || {
+                    let _taken = cancel_for_installed.borrow_mut().take();
                     status_for_installed.set_text(if returns_to_stable {
                         "Stable release installed — restart to apply"
                     } else {
@@ -1763,7 +1835,17 @@ fn update_check_row(
                     checking_for_installed.set(false);
                     restart_application(&button_for_installed);
                 },
+                move || {
+                    let _taken = cancel_for_cancelled.borrow_mut().take();
+                    status_for_cancelled.set_text("Update cancelled");
+                    progress_for_cancelled.set_visible(false);
+                    button_for_cancelled.set_label("Check now");
+                    button_for_cancelled.set_sensitive(true);
+                    checking_for_cancelled.set(false);
+                    installing_for_cancelled.set(false);
+                },
                 move |message| {
+                    let _taken = cancel_for_failed.borrow_mut().take();
                     match message {
                         Some(message) => status_for_failed
                             .set_text(&format!("Couldn't install update: {message}")),
@@ -1776,6 +1858,13 @@ fn update_check_row(
                     installing_for_failed.set(false);
                 },
             );
+            let started = match started {
+                Ok(cancel) => {
+                    *cancel_handle.borrow_mut() = Some(cancel);
+                    Ok(())
+                }
+                Err(request) => Err(request),
+            };
             if let Err(request) = started {
                 // An install from an update dialog or another window is
                 // already running. Leave this row
@@ -1806,6 +1895,8 @@ fn update_check_row(
         run_check,
         responsive_action: (summary, button),
         install_underway,
+        status: row_status,
+        pending_download: row_pending_download,
     }
 }
 
@@ -1818,7 +1909,10 @@ enum InstallProgress {
     Downloading { downloaded: u64, total: Option<u64> },
     Verifying,
     Installing,
+    Finalizing,
 }
+
+const FINALIZING_STATUS: &str = "Finalizing update…";
 
 /// Drives an install `receiver` on the GTK main loop until it reports a
 /// terminal outcome, then stops.
@@ -1836,6 +1930,7 @@ fn drive_install(
     receiver: std::sync::mpsc::Receiver<UpdateInstall>,
     on_progress: impl Fn(InstallProgress) + 'static,
     on_installed: impl Fn() + 'static,
+    on_cancelled: impl Fn() + 'static,
     on_failed: impl Fn(Option<String>) + 'static,
 ) {
     glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -1846,8 +1941,13 @@ fn drive_install(
                 }
                 Ok(UpdateInstall::Verifying) => on_progress(InstallProgress::Verifying),
                 Ok(UpdateInstall::Installing) => on_progress(InstallProgress::Installing),
+                Ok(UpdateInstall::Finalizing) => on_progress(InstallProgress::Finalizing),
                 Ok(UpdateInstall::Installed) => {
                     on_installed();
+                    return glib::ControlFlow::Break;
+                }
+                Ok(UpdateInstall::Cancelled) => {
+                    on_cancelled();
                     return glib::ControlFlow::Break;
                 }
                 Ok(UpdateInstall::Failed(message)) => {
@@ -1864,31 +1964,24 @@ fn drive_install(
     });
 }
 
-/// Starts `request`'s install unless another install-guarded flow is
-/// already running, driving it with [`drive_install`] and clearing `guard`
-/// once it reaches a terminal state.
-///
-/// `guard` is shared by [`update_check_row`] and [`show_update_dialog`] -- the
-/// only call sites of [`services::install_update`]. Without it, controls in
-/// separate windows could start two replacement threads concurrently.
-///
-/// Returns `Ok(())` once an install has started, or `Err(request)` --
-/// handing `request` back unused -- if `guard` was already held. Callers
-/// must handle the `Err` case by leaving their own button/status in a
-/// re-triable state, since the click that produced it did not actually
-/// start anything.
+/// The shared guard prevents concurrent replacements from different windows.
+/// Guard rejection leaves the request unused and must keep the caller retryable.
 fn start_install(
     guard: &InstallGuard,
     request: InstallRequest,
+    launcher: &InstallLauncher,
     on_progress: impl Fn(InstallProgress) + 'static,
     on_installed: impl Fn() + 'static,
+    on_cancelled: impl Fn() + 'static,
     on_failed: impl Fn(Option<String>) + 'static,
-) -> Result<(), InstallRequest> {
+) -> Result<InstallCancel, InstallRequest> {
     if guard.replace(true) {
         return Err(request);
     }
-    let receiver = services::install_update(request);
+    let cancel = InstallCancel::new();
+    let receiver = launcher(request, cancel.clone());
     let guard_for_installed = guard.clone();
+    let guard_for_cancelled = guard.clone();
     let guard_for_failed = guard.clone();
     drive_install(
         receiver,
@@ -1897,12 +1990,16 @@ fn start_install(
             guard_for_installed.set(false);
             on_installed();
         },
+        move || {
+            guard_for_cancelled.set(false);
+            on_cancelled();
+        },
         move |message| {
             guard_for_failed.set(false);
             on_failed(message);
         },
     );
-    Ok(())
+    Ok(cancel)
 }
 
 /// The update row's compact progress rendering, distinct from the update
@@ -1930,6 +2027,10 @@ fn apply_install_progress(
         InstallProgress::Installing => {
             progress.set_fraction(1.0);
             status.set_text("Installing update…");
+        }
+        InstallProgress::Finalizing => {
+            progress.set_fraction(1.0);
+            status.set_text(FINALIZING_STATUS);
         }
     }
 }
@@ -1960,16 +2061,23 @@ fn restart_waiter(current_exe: &std::path::Path, parent_pid: u32) -> Option<Comm
     let mut command = crate::trusted_command::command("sh").ok()?;
     let sleep = crate::trusted_command::resolve("sleep").ok()?;
     let start_time = process_start_time(parent_pid).unwrap_or_default();
+    let date = crate::trusted_command::resolve("date").ok()?;
+    let mv = crate::trusted_command::resolve("mv").ok()?;
+    let rollback = current_exe.parent().map(services::rollback_path)?;
     command
         .args([
             "-c",
-            "pid=$1; binary=$2; sleeper=$3; born=$4; while kill -0 \"$pid\" 2>/dev/null && [ -r \"/proc/$pid/stat\" ]; do IFS= read -r stat < \"/proc/$pid/stat\" || break; rest=${stat##*) }; set -- $rest; shift 19; [ \"${1:-}\" = \"$born\" ] || break; \"$sleeper\" 0.1; done; \"$sleeper\" 0.5; exec \"$binary\"",
+            "pid=$1; binary=$2; sleeper=$3; born=$4; rollback=$5; clock=$6; mover=$7; grace=$8; while kill -0 \"$pid\" 2>/dev/null && [ -r \"/proc/$pid/stat\" ]; do IFS= read -r stat < \"/proc/$pid/stat\" || break; rest=${stat##*) }; set -- $rest; shift 19; [ \"${1:-}\" = \"$born\" ] || break; \"$sleeper\" 0.1; done; \"$sleeper\" 0.5; started=$(\"$clock\" +%s); \"$binary\" && exit 0; status=$?; [ $(($(\"$clock\" +%s) - started)) -lt \"$grace\" ] || exit \"$status\"; [ -f \"$rollback\" ] || exit \"$status\"; \"$mover\" -f -- \"$rollback\" \"$binary\" && exec \"$binary\"; exit \"$status\"",
             "strata-restart",
         ])
         .arg(parent_pid.to_string())
         .arg(current_exe)
         .arg(sleep)
         .arg(start_time)
+        .arg(rollback)
+        .arg(date)
+        .arg(mv)
+        .arg(RESTART_GRACE_SECONDS.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1985,7 +2093,11 @@ fn restart_waiter(current_exe: &std::path::Path, parent_pid: u32) -> Option<Comm
     Some(command)
 }
 
+/// A closed window may no longer have an application; never exit the process in that case.
 fn restart(application: Option<&gtk::Application>) {
+    let Some(application) = application else {
+        return;
+    };
     let Ok(current_exe) = crate::services::installed_executable() else {
         return;
     };
@@ -2002,22 +2114,58 @@ fn restart(application: Option<&gtk::Application>) {
     if waiter.spawn().is_err() {
         return;
     }
-    match application {
-        Some(application) => application.quit(),
-        None => std::process::exit(0),
-    }
+    application.quit();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateDialogPhase {
+    Ready,
+    Downloading,
+    Finalizing,
+    Cancelled,
+    Failed,
+    Installed,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "tests drive the dialog through these handles")
+)]
+struct UpdateDialog {
+    layer: gtk::Box,
+    cancel: gtk::Button,
+    close: gtk::Button,
+    action: gtk::Button,
+    status: gtk::Label,
+    escape: gtk::EventControllerKey,
 }
 
 pub(super) fn show_update_dialog(
     parent: &gtk::Window,
     release: &ReleaseMetadata,
-    download_url: String,
+    install: InstallRequest,
     install_guard: InstallGuard,
     update_method: UpdateMethod,
 ) {
-    let Some(window_overlay) = parent.child().and_downcast::<gtk::Overlay>() else {
-        return;
-    };
+    let _dialog = build_update_dialog(
+        parent,
+        release,
+        install,
+        install_guard,
+        update_method,
+        default_install_launcher(),
+    );
+}
+
+fn build_update_dialog(
+    parent: &gtk::Window,
+    release: &ReleaseMetadata,
+    install: InstallRequest,
+    install_guard: InstallGuard,
+    update_method: UpdateMethod,
+    launcher: InstallLauncher,
+) -> Option<UpdateDialog> {
+    let window_overlay = parent.child().and_downcast::<gtk::Overlay>()?;
     let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
     if let Some(root) = blurred_root.as_ref() {
         root.set_blurred(true);
@@ -2113,47 +2261,82 @@ pub(super) fn show_update_dialog(
     let cancel = layout.cancel;
     let action = layout.confirm;
 
-    let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
+    let phase = Rc::new(Cell::new(UpdateDialogPhase::Ready));
+    let cancel_handle = Rc::new(RefCell::new(None::<InstallCancel>));
+    let set_dismissible: Rc<dyn Fn(bool)> = Rc::new({
+        let cancel = cancel.clone();
+        let close = close.clone();
+        move |enabled| {
+            cancel.set_sensitive(enabled);
+            close.set_sensitive(enabled);
+        }
+    });
+    let enter_finalizing: Rc<dyn Fn()> = Rc::new({
+        let phase = phase.clone();
+        let status = status.clone();
+        let progress = progress.clone();
+        let set_dismissible = set_dismissible.clone();
+        move || {
+            phase.set(UpdateDialogPhase::Finalizing);
+            progress.set_fraction(1.0);
+            status.set_text(FINALIZING_STATUS);
+            set_dismissible(false);
+        }
+    });
+    let close_dialog: Rc<dyn Fn(&gtk::Box)> = Rc::new({
+        let phase = phase.clone();
+        let cancel_handle = cancel_handle.clone();
+        let enter_finalizing = enter_finalizing.clone();
+        let overlay = window_overlay.clone();
+        let root = blurred_root.clone();
+        move |layer| {
+            match phase.get() {
+                UpdateDialogPhase::Finalizing => return,
+                UpdateDialogPhase::Downloading => {
+                    let committed = cancel_handle
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|handle| !handle.cancel());
+                    if committed {
+                        // The installer can commit before its Finalizing event reaches the UI.
+                        enter_finalizing();
+                        return;
+                    }
+                    cancel_handle.take();
+                    phase.set(UpdateDialogPhase::Cancelled);
+                }
+                UpdateDialogPhase::Ready
+                | UpdateDialogPhase::Cancelled
+                | UpdateDialogPhase::Failed
+                | UpdateDialogPhase::Installed => {}
+            }
+            dismiss_modal_layer(layer, &overlay, root.as_ref());
+        }
+    });
+    let layer = modal_layer_with_backdrop(&content, close_dialog.clone());
     window_overlay.add_overlay(&layer);
     action.grab_focus();
 
-    let started = Rc::new(Cell::new(false));
-    let cancel_layer = layer.clone();
-    let cancel_overlay = window_overlay.clone();
-    let cancel_root = blurred_root.clone();
-    let cancel_started = started.clone();
-    cancel.connect_clicked(move |_| {
-        if !cancel_started.get() {
-            dismiss_modal_layer(&cancel_layer, &cancel_overlay, cancel_root.as_ref());
-        }
-    });
-    let close_layer = layer.clone();
-    let close_overlay = window_overlay.clone();
-    let close_root = blurred_root.clone();
-    let close_started = started.clone();
-    close.connect_clicked(move |_| {
-        if !close_started.get() {
-            dismiss_modal_layer(&close_layer, &close_overlay, close_root.as_ref());
-        }
-    });
+    for button in [&cancel, &close] {
+        let close_dialog = close_dialog.clone();
+        let layer = layer.clone();
+        button.connect_clicked(move |_| close_dialog(&layer));
+    }
     let escape = gtk::EventControllerKey::new();
-    let escape_layer = layer.clone();
-    let escape_overlay = window_overlay.clone();
-    let escape_root = blurred_root.clone();
-    let escape_started = started.clone();
-    escape.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
-            if !escape_started.get() {
-                dismiss_modal_layer(&escape_layer, &escape_overlay, escape_root.as_ref());
+    escape.connect_key_pressed({
+        let close_dialog = close_dialog.clone();
+        let layer = layer.clone();
+        move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                close_dialog(&layer);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
             }
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
         }
     });
-    layer.add_controller(escape);
+    layer.add_controller(escape.clone());
 
-    let installed = Rc::new(Cell::new(false));
     // Set when the offer this dialog was opened with is no longer eligible on
     // the current channel, which turns the action button into a plain Close.
     let withdrawn = Rc::new(Cell::new(false));
@@ -2173,10 +2356,9 @@ pub(super) fn show_update_dialog(
     PreferenceManager::shared().on_release_channel_changed(&layer, {
         let withdraw = withdraw.clone();
         let withdrawn = withdrawn.clone();
-        let started = started.clone();
-        let installed = installed.clone();
+        let phase = phase.clone();
         Rc::new(move || {
-            if started.get() || installed.get() || withdrawn.get() {
+            if phase.get() != UpdateDialogPhase::Ready || withdrawn.get() {
                 return;
             }
             if !offer_still_eligible(PreferenceManager::shared().release_channel(), offered_kind) {
@@ -2188,7 +2370,7 @@ pub(super) fn show_update_dialog(
     let action_overlay = window_overlay.clone();
     let action_root = blurred_root.clone();
     let application = parent.application();
-    let action_close = close.clone();
+    let dialog_status = status.clone();
     action.connect_clicked(move |button| {
         if update_method == UpdateMethod::Aur {
             if aur_action == "Close" {
@@ -2220,10 +2402,19 @@ pub(super) fn show_update_dialog(
             button.set_sensitive(false);
             return;
         }
-        if installed.get() {
-            restart(application.as_ref());
-            button.set_sensitive(false);
-            return;
+        match phase.get() {
+            UpdateDialogPhase::Installed => {
+                restart(application.as_ref());
+                button.set_sensitive(false);
+                return;
+            }
+            UpdateDialogPhase::Failed | UpdateDialogPhase::Cancelled => {
+                dismiss_modal_layer(&action_layer, &action_overlay, action_root.as_ref());
+                button.set_sensitive(false);
+                return;
+            }
+            UpdateDialogPhase::Downloading | UpdateDialogPhase::Finalizing => return,
+            UpdateDialogPhase::Ready => {}
         }
         if withdrawn.get() {
             dismiss_modal_layer(&action_layer, &action_overlay, action_root.as_ref());
@@ -2233,21 +2424,15 @@ pub(super) fn show_update_dialog(
         // Read the channel at the click, not when the dialog was opened: this
         // dialog is driven by the sidebar notice, whose cached offer survives
         // a channel switch made anywhere in the process -- including in
-        // another window. `withdrawn` rather than `started` so Cancel and
+        // another window. `withdrawn` rather than a phase change so Cancel and
         // Escape keep dismissing normally.
         if !offer_still_eligible(PreferenceManager::shared().release_channel(), offered_kind) {
             withdraw();
             return;
         }
-        if started.replace(true) {
-            dismiss_modal_layer(&action_layer, &action_overlay, action_root.as_ref());
-            button.set_sensitive(false);
-            return;
-        }
 
+        phase.set(UpdateDialogPhase::Downloading);
         button.set_sensitive(false);
-        cancel.set_sensitive(false);
-        action_close.set_sensitive(false);
         progress.set_visible(true);
         status.set_text("Starting download…");
         let progress_for_progress = progress.clone();
@@ -2255,21 +2440,27 @@ pub(super) fn show_update_dialog(
         let progress_for_installed = progress.clone();
         let status_for_installed = status.clone();
         let action_for_installed = button.clone();
-        let installed_for_installed = installed.clone();
+        let phase_for_installed = phase.clone();
+        let dismissible_for_installed = set_dismissible.clone();
         let progress_for_failed = progress.clone();
         let status_for_failed = status.clone();
         let action_for_failed = button.clone();
-        let status_for_guard = status.clone();
-        let progress_for_guard = progress.clone();
-        let action_for_guard = button.clone();
-        let started_for_guard = started.clone();
+        let phase_for_failed = phase.clone();
+        let dismissible_for_failed = set_dismissible.clone();
+        let phase_for_progress = phase.clone();
+        let enter_finalizing = enter_finalizing.clone();
         let install_guard = install_guard.clone();
-        let request = InstallRequest {
-            download_url: download_url.clone(),
-        };
+        let cancel_for_installed = cancel_handle.clone();
+        let cancel_for_cancelled = cancel_handle.clone();
+        let cancel_for_failed = cancel_handle.clone();
+        let phase_for_cancelled = phase.clone();
+        let layer_for_cancelled = action_layer.clone();
+        let overlay_for_cancelled = action_overlay.clone();
+        let root_for_cancelled = action_root.clone();
         let outcome = start_install(
             &install_guard,
-            request,
+            install.clone(),
+            &launcher,
             move |event| match event {
                 InstallProgress::Downloading { downloaded, total } => {
                     if let Some(total) = total.filter(|total| *total > 0) {
@@ -2294,17 +2485,37 @@ pub(super) fn show_update_dialog(
                     progress_for_progress.set_fraction(1.0);
                     status_for_progress.set_text("Installing update…");
                 }
+                InstallProgress::Finalizing => {
+                    if phase_for_progress.get() == UpdateDialogPhase::Downloading {
+                        enter_finalizing();
+                    }
+                }
             },
             move || {
+                let _taken = cancel_for_installed.borrow_mut().take();
+                phase_for_installed.set(UpdateDialogPhase::Installed);
                 progress_for_installed.set_fraction(1.0);
                 status_for_installed.set_text("Update installed — restart to apply");
                 action_for_installed.set_label("Restart now");
                 action_for_installed.add_css_class("suggested-action");
                 action_for_installed.set_sensitive(true);
-                installed_for_installed.set(true);
+                // Restart can fail; leave a way to close the dialog.
+                dismissible_for_installed(true);
                 restart_application(&action_for_installed);
             },
+            move || {
+                let _taken = cancel_for_cancelled.borrow_mut().take();
+                phase_for_cancelled.set(UpdateDialogPhase::Cancelled);
+                dismiss_modal_layer(
+                    &layer_for_cancelled,
+                    &overlay_for_cancelled,
+                    root_for_cancelled.as_ref(),
+                );
+            },
             move |message| {
+                let _taken = cancel_for_failed.borrow_mut().take();
+                phase_for_failed.set(UpdateDialogPhase::Failed);
+                dismissible_for_failed(true);
                 match message {
                     Some(message) => {
                         status_for_failed.set_text(&format!("Couldn’t install update: {message}"));
@@ -2316,18 +2527,24 @@ pub(super) fn show_update_dialog(
                 action_for_failed.set_sensitive(true);
             },
         );
-        if outcome.is_err() {
-            // An install from the update row or another window is already
-            // running. Reset `started` too, so the next
-            // click retries the install instead of being treated as a
-            // dismissal -- this click never actually started one.
-            status_for_guard.set_text("Another install is already running — try again shortly.");
-            progress_for_guard.set_visible(false);
-            action_for_guard.set_sensitive(true);
-            cancel.set_sensitive(true);
-            started_for_guard.set(false);
+        match outcome {
+            Ok(handle) => *cancel_handle.borrow_mut() = Some(handle),
+            Err(_request) => {
+                phase.set(UpdateDialogPhase::Ready);
+                status.set_text("Another install is already running — try again shortly.");
+                progress.set_visible(false);
+                button.set_sensitive(true);
+            }
         }
     });
+    Some(UpdateDialog {
+        layer,
+        cancel,
+        close,
+        action,
+        status: dialog_status,
+        escape,
+    })
 }
 
 fn aur_update_action_label() -> &'static str {

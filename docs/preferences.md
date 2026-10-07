@@ -10,7 +10,11 @@ the theme catalog, shared CSS application, custom themes, and Omarchy following;
 it reads preferences through the `PreferenceManager` and reapplies shared CSS when
 appearance preferences change. Fresh installations select Tokyo Night, unless an
 available Omarchy theme is followed automatically. Saved theme choices remain
-unchanged.
+unchanged. Folder peeking is off by default when no value is saved; explicitly
+saved choices are preserved. Enable it under **Settings → General → Browsing**.
+When enabled, automatic folder peeks in Icons and List wait for a 500 ms hover;
+explicit keyboard peeks in those views remain immediate. Miller columns never
+show folder-peek popovers, regardless of the saved preference.
 
 Settings-wide search is transient, panel-local UI state, not a saved preference.
 It filters the existing bound controls rather than creating copies. Register new
@@ -54,17 +58,18 @@ control that might be midway through synchronization.
 | Stored preferences | Consumer / application point |
 | --- | --- |
 | Default directory | New windows without an explicit target read the current choice before navigating, without opening Settings. Existing windows and explicit targets are unchanged. Missing directories fall back to home and clear the saved choice; Reset also restores home. |
-| Folder peeking, single-click previews, columns selection mirror, mode, density, grouping, per-mode click counts, auto-refresh | Every browser binds at construction, including lazily rebuilt view modes. The chooser explicitly disallows folder peeking and the columns selection mirror regardless of the saved values. |
+| Folder peeking, single-click previews, columns selection mirror, mode, density, grouping, per-mode click counts, auto-refresh | Every browser binds at construction, including lazily rebuilt view modes. Miller columns disallow folder-peek popovers regardless of the saved value; Icons and List retain the preference. The chooser explicitly disallows folder peeking and the columns selection mirror regardless of the saved values. |
 | Hidden files | Shared across existing browsers and new columns. |
 | Open folder after dropping files | Drop dispatch reads the saved choice (off by default), including confirmation of cross-device drops. Successful drops reveal the destination only when enabled and the user is still at the transfer origin. Paste and Move/Copy to remain unchanged. |
 | Cross-device drag and drop | Drop dispatch reads the current Copy, Move, or Ask strategy; unresolved volume lookups follow the same cross-device policy. |
 | Sort key/direction, folders-first | Shared defaults for new columns; an existing column keeps its own sort, selection and navigation. Explicit field sorting updates the persisted defaults. Camera Photos libraries instead open in column-local Device order (see below). |
 | Type-to-search, opening search results directly | Keyboard/search actions read the current manager value at dispatch. |
+| Global search exclusions | Each global-search invocation reads the current rules before indexing, including before Settings opens. Existing search snapshots keep their rules until reopened. Exclusion editors synchronize across windows. Pane filters, 10xer path search, folder-history search, and destination pickers retain their explicit browsing scope and ignore these rules. |
 | 10xer mode | Interactive browsers and the portal file chooser bind pane Close/filter/refresh/sort chrome and the Yazi-style keymap at construction, including lazily rebuilt views. Window Search hides in interactive browsers. Window Close, chooser Accept/Cancel, and List column headings stay. Unclaimed letter commands return focus from non-text window chrome to the listing; text fields, menus, and previews retain their own input. Off by default; toggle with `Ctrl+Shift+M` or Settings → General → Browsing. Enabling shows a brief non-interactive splash that respects Reduce motion; reopening an already-enabled window does not replay it. |
 | Include subfolders | Every pane filter binds at construction, including lazy view rebuilds. Enabled by default; disabling indexes only immediate files and folders, without traversing descendants. Live changes cancel pending queries and invalidate old result streams before refreshing the active filter. Global search remains recursive. 10xer mode ignores it: entering or leaving the mode re-runs active filters in the new scope. |
-| Element glow | Shared semantic glow color is applied by `ThemeManager` when the appearance preferences change, before Settings opens and live across windows, dialogs, menus, and rebuilt views. Focus outlines and ordinary depth shadows are preserved. |
+| Element glow | Shared semantic glow color is applied by `ThemeManager` when the appearance preferences change, before Settings opens and live across windows, dialogs, menus, and rebuilt views. Focus outlines and ordinary depth shadows are preserved. The video preview's ambient light, and the band it needs around the frame, follow the same switch live. |
 | Reduced motion | Set before any window is constructed; animation helpers read the current process-wide value. |
-| Theme, Omarchy following, text size | `ThemeManager` applies shared CSS when theme selection, Omarchy following, text size, or element glow change; controls and theme-card selections bind to preferences through `ThemeManager::bind_theme_preference`. Newly saved custom themes appear in other open theme pages. Missing themes/Omarchy use the existing fallback policy. |
+| Theme, Omarchy following/variant, text size | `ThemeManager` applies shared CSS when theme selection, Omarchy following, Omarchy variant, text size, or element glow change; controls and theme-card selections bind to preferences through `ThemeManager::bind_theme_preference`. Newly saved custom themes appear in other open theme pages. Missing themes/Omarchy use the existing fallback policy. |
 | Interface renderer | GTK selects the renderer at process startup. The saved GTK default or Cairo choice is read before GTK initializes; GTK default is selected for new installs. The control and Restart button synchronize across Settings windows, but changes take effect only after restarting Strata (via the button or after fully quitting and reopening). An explicit `GSK_RENDERER` always overrides the saved choice. |
 | Keybinding hints | Navigation hints and the shortcuts button bind immediately and live. When hidden, the status bar appears only while the clipboard badge or F1 reference needs it; otherwise the empty bar is hidden. |
 | Thumbnail workers | Browser construction binds the shared decoder limit before Settings opens. Changes apply across windows and rebuilt views; lowering the limit lets active work finish and retires excess idle supervisors. |
@@ -72,7 +77,7 @@ control that might be midway through synchronization.
 | Icons view thumbnail size | Every browser binds at construction, before the browser mode preference applies, so an Icons pane built at startup already uses the saved size. The popover slider's own live change persists it; other windows' visible Icons panes move their slider (and resize) to match. Clamped to 32–256 px; not exposed in Settings. |
 | Hardware video acceleration/backend | Preview providers read the current choice when requesting a preview; changing it does not restart an already playing file. Settings controls and backend availability synchronize live. |
 | Preview text wrap | Every text preview and header toggle binds to the saved wrap choice, including newly loaded files. Off by default. |
-| Preview autoplay | Read when a video, audio, or GIF preview is first shown. Off by default: playback waits for an explicit play action, and the center play affordance is shown instead. Does not affect resuming playback that was already active before a preview pane was temporarily hidden by a resize. |
+| Preview autoplay | Read when a video, audio, or GIF preview is first shown. Off by default: playback waits for an explicit play action; the generic player shows its center play affordance, and the audio and video views their transport play button. When on, playback starts silent and fades in on a slow-in, slow-out curve, over 1 s from the first frame for video and over 0.5 s from the first sample for audio, unless the saved audio state is muted or the file is shorter than 10 s, which plays at full volume at once; any play, pause, seek, volume or mute input brings the sound in at once, and the saved volume is never changed. Continuing playback into the next file with `<` / `>` keeps its sound. Does not affect resuming playback that was already active before a preview pane was temporarily hidden by a resize. |
 | Render documents by default | A newly loaded Markdown or HTML preview reads the current choice for its initial Rendered or Source view. Switching the view of an open document does not change the saved default. |
 | Preview mute/volume | Every player's controls and media stream bind to the saved audio state. Slider changes publish/persist together, without a delayed stale save overwriting another window or being discarded when closing a preview. |
 | Automatic updates, release channel | Eligibility checks read current preferences. Controls synchronize, and all windows clear outdated notices when these preferences change, even without opening Settings. A package-managed installation's tracked channel is enforced when read, not by constructing Settings. |
@@ -152,6 +157,18 @@ position remain independent of interface text size. At extreme sizes on small
 logical displays, scrolling or resizing panes may be necessary. Physical
 mixed-DPI monitor transitions still need compositor-specific manual testing.
 
+## Omarchy variants
+
+Under **Settings → Appearance**, **Omarchy variant** sits below **Follow Omarchy**.
+**Original** preserves the current mapping; **Darker** uses dark terminal-like
+surfaces; **High contrast** strengthens readability while retaining the palette's
+light/dark character. See [Themes](themes.md#omarchy-quattro) for color behavior.
+Saved as `omarchy_variant = "original"`, `"darker"`, or `"high_contrast"`, the
+choice applies at startup and live across windows and previews, including after
+Omarchy changes themes. It is remembered but inactive when following is off.
+Missing or invalid saved values fall back to Original without resetting other
+preferences.
+
 ## Interface renderer
 
 **Settings → Appearance → Rendering** offers **GTK default** (initial choice) and **Cairo**.
@@ -209,6 +226,19 @@ selected, it uses "Sep 24, 2026, 9:30 PM"; ISO 8601 and Long retain their select
 formats. This applies both to cached timestamps shown when the dialog opens and
 to asynchronously loaded file/folder metadata. Open Properties dialogs follow
 format changes live, just like lists and previews.
+
+## Global search exclusions
+
+In **Settings → General → Search & filtering → Global search exclusions**, enter
+a folder name or absolute directory path and press **Enter** or **Add**, or use
+**Browse…** to select a directory. The scrollable list below the form shows saved
+exclusions, with a remove button for each. Folder names match case-insensitively
+anywhere in the tree; directory paths are
+case-sensitive and exclude only that subtree. `~/` expands to home. Folder names
+are literal, not glob patterns. Built-in tool/cache exclusions remain in effect.
+Rules are stored as `search_exclusions`; invalid saved rules are ignored. Root,
+the entire home directory, relative paths, and paths containing `..` are rejected.
+Changes apply the next time global search opens, across all windows.
 
 ## Filter scope
 

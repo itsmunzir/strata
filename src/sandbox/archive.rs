@@ -25,12 +25,13 @@ pub(crate) enum Member<'a> {
     File { size: u64, body: &'a mut dyn Read },
 }
 
+/// Callback errors lose their kind; only decoder failures retain it across the wire.
 pub(crate) fn stream_rar(
     archive_path: &Path,
     password: Option<&str>,
     cancelled: &AtomicBool,
-    on_member: impl FnMut(&str, Member<'_>) -> Result<(), String>,
-) -> Result<(), String> {
+    on_member: impl FnMut(&str, Member<'_>, wire::WireMetadata) -> Result<(), String>,
+) -> Result<(), wire::Failure> {
     let mut child = spawn(archive_path, password)?;
     let stdout = child
         .stdout
@@ -52,16 +53,18 @@ pub(crate) fn stream_rar(
 
 fn drive(
     mut reader: impl Read,
-    mut on_member: impl FnMut(&str, Member<'_>) -> Result<(), String>,
-) -> Result<(), String> {
+    mut on_member: impl FnMut(&str, Member<'_>, wire::WireMetadata) -> Result<(), String>,
+) -> Result<(), wire::Failure> {
     wire::read_magic(&mut reader).map_err(|error| error.to_string())?;
     loop {
         let record = wire::read_record(&mut reader).map_err(|error| error.to_string())?;
         match record {
             wire::Record::End => return Ok(()),
-            wire::Record::Error(message) => return Err(message),
-            wire::Record::Directory(name) => on_member(&name, Member::Directory)?,
-            wire::Record::File(name, size) => {
+            wire::Record::Error(failure) => return Err(failure),
+            wire::Record::Directory(name, metadata) => {
+                on_member(&name, Member::Directory, metadata)?;
+            }
+            wire::Record::File(name, size, metadata) => {
                 let mut body = wire::FileBody::new(&mut reader, size);
                 on_member(
                     &name,
@@ -69,9 +72,9 @@ fn drive(
                         size,
                         body: &mut body,
                     },
+                    metadata,
                 )?;
-                std::io::copy(&mut body, &mut std::io::sink())
-                    .map_err(|error| error.to_string())?;
+                std::io::copy(&mut body, &mut std::io::sink()).map_err(wire::Failure::from_io)?;
             }
         }
     }

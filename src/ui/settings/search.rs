@@ -96,6 +96,12 @@ const TARGETS: &[Target] = &[
         aliases: "launch files quick preview",
     },
     Target {
+        id: "search-exclusions",
+        page: "general",
+        title: "Global search exclusions",
+        aliases: "search filter exclusions exclude folders directories ignore venv prune",
+    },
+    Target {
         id: "sidebar-places",
         page: "general",
         title: "Items shown in sidebar",
@@ -148,6 +154,12 @@ const TARGETS: &[Target] = &[
         page: "theme",
         title: "Follow Omarchy",
         aliases: "appearance system theme quattro",
+    },
+    Target {
+        id: "omarchy-variant",
+        page: "theme",
+        title: "Omarchy variant",
+        aliases: "appearance system theme quattro palette original normal darker dark high contrast brightness",
     },
     Target {
         id: "current-theme",

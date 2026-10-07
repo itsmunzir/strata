@@ -5,6 +5,7 @@ pub(crate) mod camera_preview;
 mod document;
 pub(crate) mod document_media;
 pub(crate) mod docx;
+pub(crate) mod file_providers;
 mod file_source;
 pub(crate) mod image_conversion;
 mod install_source;
@@ -62,9 +63,10 @@ pub(crate) use navigation_history::NavigationHistory;
 pub use operations::{
     ArchiveFormat, CancelledOperation, CompressRequest, CreateDirectoryRequest, CreateFileRequest,
     DeleteRequest, ExtractRequest, MoveRecord, OperationEvent, OperationProvider,
-    OperationRequestId, PasteItem, PasteRequest, RenameRecord, RenameRequest, RestoreRequest,
-    RestoreSource, RestoreTrashItem, TransferConflict, TrashedOriginal, UndoCopyRequest,
-    UndoMergeRequest, UndoMoveItem, UndoMoveRequest, UndoRenameRequest, validate_basename,
+    OperationRequestId, PasswordFailure, PasteItem, PasteRequest, RenameRecord, RenameRequest,
+    RestoreRequest, RestoreSource, RestoreTrashItem, TransferConflict, TrashedOriginal,
+    UndoCopyRequest, UndoMergeRequest, UndoMoveItem, UndoMoveRequest, UndoRenameRequest,
+    validate_basename,
 };
 pub(crate) use path_match::{PathMatcher, PathQuery};
 pub use preview::{
@@ -93,13 +95,14 @@ pub(crate) use remote_download::{
 };
 pub(crate) use search::{RESULT_LIMIT as SEARCH_RESULT_LIMIT, refresh_search_indexes_for_rename};
 pub(crate) use search::{
-    RefusedFolders, SearchCoverage, SearchEvent, SearchHandle, SearchItem, filter_name_matches,
-    filter_query_allows_typos, fold_for_search, index_filter, index_folder_paths, index_paths,
-    index_trees,
+    RefusedFolders, SearchCoverage, SearchEvent, SearchExclusions, SearchHandle, SearchItem,
+    filter_name_matches, filter_query_allows_typos, fold_for_search, index_filter,
+    index_folder_paths, index_paths, index_trees_with_exclusions,
 };
 pub(crate) use update_check::{
     ReleaseMetadata, ReleaseNotes, UpdateCheck, check_for_updates, fetch_release_notes,
 };
 pub(crate) use update_install::{
-    InstallRequest, UpdateInstall, UpdateMethod, install_update, update_method,
+    InstallCancel, InstallRequest, UpdateInstall, UpdateMethod, install_update, rollback_path,
+    update_method,
 };
